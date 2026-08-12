@@ -24,7 +24,7 @@ use async_trait::async_trait;
 
 use crate::table::Table;
 use crate::transaction::Transaction;
-use crate::{Result, TableRequirement, TableUpdate};
+use crate::{Error, Result, TableRequirement, TableUpdate};
 
 /// A boxed, thread-safe reference to an object-safe transaction action.
 pub(crate) type BoxedTransactionAction = Arc<dyn DynTransactionAction>;
@@ -103,6 +103,15 @@ pub(crate) trait TransactionAction: AsAny + Sync + Send {
     /// An `ActionCommit` containing table updates and table requirements,
     /// or an error if the commit fails.
     async fn commit(&self, state: &mut Self::State, table: &Table) -> Result<ActionCommit>;
+
+    /// Clean up artifacts after the transaction reaches a terminal outcome.
+    async fn finish_commit(
+        &self,
+        _state: &mut Self::State,
+        _table: &Table,
+        _commit_error: Option<&Error>,
+    ) {
+    }
 }
 
 /// Object-safe adapter for storing heterogeneous transaction actions.
@@ -113,6 +122,13 @@ pub(crate) trait DynTransactionAction: AsAny + Sync + Send {
         state: &mut dyn DynTransactionActionState,
         table: &Table,
     ) -> Result<ActionCommit>;
+
+    async fn finish_commit(
+        &self,
+        state: &mut dyn DynTransactionActionState,
+        table: &Table,
+        commit_error: Option<&Error>,
+    );
 
     fn new_state(&self) -> Box<dyn DynTransactionActionState>;
 }
@@ -129,6 +145,19 @@ impl<T: TransactionAction> DynTransactionAction for T {
             .downcast_mut::<T::State>()
             .expect("an action entry must contain its action's associated state type");
         TransactionAction::commit(self, state, table).await
+    }
+
+    async fn finish_commit(
+        &self,
+        state: &mut dyn DynTransactionActionState,
+        table: &Table,
+        commit_error: Option<&Error>,
+    ) {
+        let state = state
+            .as_any_mut()
+            .downcast_mut::<T::State>()
+            .expect("an action entry must contain its action's associated state type");
+        TransactionAction::finish_commit(self, state, table, commit_error).await;
     }
 
     fn new_state(&self) -> Box<dyn DynTransactionActionState> {

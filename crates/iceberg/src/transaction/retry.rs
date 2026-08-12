@@ -17,6 +17,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use uuid::Uuid;
+
 use crate::spec::{ManifestContentType, ManifestFile, Operation, SnapshotRef};
 use crate::table::Table;
 use crate::{Error, ErrorKind, Result};
@@ -68,11 +70,94 @@ impl ProcessedSnapshot {
 #[derive(Default)]
 pub(crate) struct SnapshotRetryState {
     processed_snapshots: HashMap<i64, ProcessedSnapshot>,
+    commit_uuid: Option<Uuid>,
+    snapshot_id: Option<i64>,
+    attempt: u64,
+    added_data_manifest: Option<ManifestFile>,
+    owned_artifacts: HashSet<String>,
     #[cfg(test)]
     manifest_list_loads: usize,
 }
 
 impl SnapshotRetryState {
+    pub(crate) fn commit_uuid(&mut self, requested: Option<Uuid>) -> Result<Uuid> {
+        match (self.commit_uuid, requested) {
+            (Some(cached), Some(requested)) if cached != requested => Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Commit UUID changed while retrying a snapshot action",
+            )),
+            (Some(cached), _) => Ok(cached),
+            (None, requested) => {
+                let commit_uuid = requested.unwrap_or_else(Uuid::now_v7);
+                self.commit_uuid = Some(commit_uuid);
+                Ok(commit_uuid)
+            }
+        }
+    }
+
+    pub(crate) fn snapshot_id(&mut self, table: &Table) -> i64 {
+        if let Some(snapshot_id) = self.snapshot_id
+            && table.metadata().snapshot_by_id(snapshot_id).is_none()
+        {
+            return snapshot_id;
+        }
+
+        let mut snapshot_id = random_snapshot_id();
+        while table.metadata().snapshot_by_id(snapshot_id).is_some() {
+            snapshot_id = random_snapshot_id();
+        }
+        self.snapshot_id = Some(snapshot_id);
+        self.added_data_manifest = None;
+        snapshot_id
+    }
+
+    pub(crate) fn next_attempt(&mut self) -> u64 {
+        let attempt = self.attempt;
+        self.attempt += 1;
+        attempt
+    }
+
+    pub(crate) fn added_data_manifest(&self) -> Option<ManifestFile> {
+        self.added_data_manifest.clone()
+    }
+
+    pub(crate) fn cache_added_data_manifest(&mut self, manifest: ManifestFile) {
+        self.owned_artifacts.insert(manifest.manifest_path.clone());
+        self.added_data_manifest = Some(manifest);
+    }
+
+    pub(crate) fn track_manifest_list(&mut self, path: String) {
+        self.owned_artifacts.insert(path);
+    }
+
+    pub(crate) async fn cleanup(&mut self, table: &Table, commit_error: Option<&Error>) {
+        let retained = match commit_error {
+            None => self.committed_artifacts(table).await,
+            Some(err) if err.kind() == ErrorKind::CatalogCommitConflicts => Some(HashSet::new()),
+            Some(_) => None,
+        };
+
+        let Some(retained) = retained else {
+            return;
+        };
+        for path in self.owned_artifacts.difference(&retained) {
+            let _ = table.file_io().delete(path).await;
+        }
+        self.owned_artifacts.retain(|path| retained.contains(path));
+    }
+
+    async fn committed_artifacts(&self, table: &Table) -> Option<HashSet<String>> {
+        let snapshot = table.metadata().snapshot_by_id(self.snapshot_id?)?.clone();
+        let mut retained = HashSet::from([snapshot.manifest_list().to_string()]);
+        let list = table.manifest_list_reader(&snapshot).load().await.ok()?;
+        retained.extend(
+            list.entries()
+                .iter()
+                .map(|manifest| manifest.manifest_path.clone()),
+        );
+        Some(retained)
+    }
+
     async fn load_snapshot(&mut self, table: &Table, snapshot: &SnapshotRef) -> Result<bool> {
         let snapshot_id = snapshot.snapshot_id();
         let fingerprint = SnapshotFingerprint::from(snapshot);
@@ -181,6 +266,11 @@ impl SnapshotRetryState {
     fn manifest_list_loads(&self) -> usize {
         self.manifest_list_loads
     }
+}
+
+fn random_snapshot_id() -> i64 {
+    let (lhs, rhs) = Uuid::new_v4().as_u64_pair();
+    (lhs ^ rhs) as i64 & i64::MAX
 }
 
 #[cfg(test)]

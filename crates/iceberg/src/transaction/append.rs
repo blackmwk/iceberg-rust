@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::spec::{DataFile, Operation};
 use crate::table::Table;
 use crate::transaction::retry::SnapshotRetryState;
@@ -90,7 +90,7 @@ impl FastAppendAction {
         SnapshotCommitBuilder::new(
             table,
             Operation::Append,
-            self.commit_uuid.unwrap_or_else(Uuid::now_v7),
+            self.commit_uuid,
             self.snapshot_properties.clone(),
             SnapshotChanges::new(self.dedupe_added_files()),
         )
@@ -106,6 +106,15 @@ impl TransactionAction for FastAppendAction {
 
     async fn commit(&self, state: &mut Self::State, table: &Table) -> Result<ActionCommit> {
         self.commit_with_state(table, state).await
+    }
+
+    async fn finish_commit(
+        &self,
+        retry_state: &mut Self::State,
+        table: &Table,
+        commit_error: Option<&Error>,
+    ) {
+        retry_state.cleanup(table, commit_error).await;
     }
 }
 

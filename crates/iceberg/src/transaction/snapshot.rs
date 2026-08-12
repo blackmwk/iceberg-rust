@@ -50,7 +50,7 @@ impl SnapshotChanges {
 pub(crate) struct SnapshotCommitBuilder<'a> {
     table: &'a Table,
     operation: Operation,
-    commit_uuid: Uuid,
+    commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
     changes: SnapshotChanges,
     check_duplicate: bool,
@@ -60,7 +60,7 @@ impl<'a> SnapshotCommitBuilder<'a> {
     pub(crate) fn new(
         table: &'a Table,
         operation: Operation,
-        commit_uuid: Uuid,
+        commit_uuid: Option<Uuid>,
         snapshot_properties: HashMap<String, String>,
         changes: SnapshotChanges,
     ) -> Self {
@@ -98,9 +98,13 @@ impl<'a> SnapshotCommitBuilder<'a> {
             })
             .unwrap_or_default();
 
+        let commit_uuid = retry.commit_uuid(self.commit_uuid)?;
+        let snapshot_id = retry.snapshot_id(self.table);
+        let attempt = retry.next_attempt();
         let writer = SnapshotWriter::new(
             self.table,
-            self.commit_uuid,
+            snapshot_id,
+            commit_uuid,
             self.snapshot_properties,
             self.changes.added_data_files,
         );
@@ -108,15 +112,40 @@ impl<'a> SnapshotCommitBuilder<'a> {
         if self.check_duplicate {
             writer.validate_duplicate_files().await?;
         }
-        writer.commit(self.operation, existing_manifests).await
+        let result = writer
+            .commit(
+                self.operation,
+                existing_manifests,
+                attempt,
+                retry.added_data_manifest(),
+            )
+            .await?;
+        if let Some(manifest) = result.added_data_manifest {
+            retry.cache_added_data_manifest(manifest);
+        }
+        retry.track_manifest_list(result.manifest_list_path);
+        Ok(result.action_commit)
     }
 }
 
 #[cfg(test)]
 mod change_set_tests {
     use super::*;
-    use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
+    use crate::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, Literal, SnapshotRef, Struct,
+    };
     use crate::transaction::tests::make_v2_minimal_table;
+
+    fn take_snapshot(mut commit: ActionCommit) -> SnapshotRef {
+        commit
+            .take_updates()
+            .into_iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(SnapshotRef::new(snapshot)),
+                _ => None,
+            })
+            .unwrap()
+    }
 
     #[tokio::test]
     async fn commits_added_data_files_from_change_set() {
@@ -136,7 +165,7 @@ mod change_set_tests {
         let mut commit = SnapshotCommitBuilder::new(
             &table,
             Operation::Append,
-            Uuid::now_v7(),
+            Some(Uuid::now_v7()),
             HashMap::new(),
             SnapshotChanges::new(vec![file]),
         )
@@ -161,6 +190,90 @@ mod change_set_tests {
             Some(&"1".to_string())
         );
     }
+
+    #[tokio::test]
+    async fn retries_reuse_manifest_and_cleanup_attempt_lists() {
+        let table = make_v2_minimal_table();
+        let file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/retry.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+        let mut retry = SnapshotRetryState::default();
+
+        let first = take_snapshot(
+            SnapshotCommitBuilder::new(
+                &table,
+                Operation::Append,
+                None,
+                HashMap::new(),
+                SnapshotChanges::new(vec![file.clone()]),
+            )
+            .commit(&mut retry)
+            .await
+            .unwrap(),
+        );
+        let second = take_snapshot(
+            SnapshotCommitBuilder::new(
+                &table,
+                Operation::Append,
+                None,
+                HashMap::new(),
+                SnapshotChanges::new(vec![file.clone()]),
+            )
+            .commit(&mut retry)
+            .await
+            .unwrap(),
+        );
+
+        assert_eq!(first.snapshot_id(), second.snapshot_id());
+        assert_ne!(first.manifest_list(), second.manifest_list());
+        let first_list = table.manifest_list_reader(&first).load().await.unwrap();
+        let second_list = table.manifest_list_reader(&second).load().await.unwrap();
+        assert_eq!(
+            first_list.entries()[0].manifest_path,
+            second_list.entries()[0].manifest_path
+        );
+
+        let paths = [
+            first.manifest_list(),
+            second.manifest_list(),
+            &first_list.entries()[0].manifest_path,
+        ];
+        let conflict = Error::new(ErrorKind::CatalogCommitConflicts, "commit conflict");
+        retry.cleanup(&table, Some(&conflict)).await;
+        for path in paths {
+            assert!(!table.file_io().exists(path).await.unwrap());
+        }
+
+        let mut unknown = SnapshotRetryState::default();
+        let snapshot = take_snapshot(
+            SnapshotCommitBuilder::new(
+                &table,
+                Operation::Append,
+                None,
+                HashMap::new(),
+                SnapshotChanges::new(vec![file]),
+            )
+            .commit(&mut unknown)
+            .await
+            .unwrap(),
+        );
+        let unknown_error = Error::new(ErrorKind::Unexpected, "commit state unknown");
+        unknown.cleanup(&table, Some(&unknown_error)).await;
+        assert!(
+            table
+                .file_io()
+                .exists(snapshot.manifest_list())
+                .await
+                .unwrap()
+        );
+    }
 }
 
 struct SnapshotWriter<'a> {
@@ -175,16 +288,23 @@ struct SnapshotWriter<'a> {
     manifest_counter: RangeFrom<u64>,
 }
 
+struct SnapshotWriteResult {
+    action_commit: ActionCommit,
+    manifest_list_path: String,
+    added_data_manifest: Option<ManifestFile>,
+}
+
 impl<'a> SnapshotWriter<'a> {
     fn new(
         table: &'a Table,
+        snapshot_id: i64,
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
     ) -> Self {
         Self {
             table,
-            snapshot_id: Self::generate_unique_snapshot_id(table),
+            snapshot_id,
             commit_uuid,
             snapshot_properties,
             added_data_files,
@@ -266,28 +386,6 @@ impl<'a> SnapshotWriter<'a> {
         }
 
         Ok(())
-    }
-
-    fn generate_unique_snapshot_id(table: &Table) -> i64 {
-        let generate_random_id = || -> i64 {
-            let (lhs, rhs) = Uuid::new_v4().as_u64_pair();
-            let snapshot_id = (lhs ^ rhs) as i64;
-            if snapshot_id < 0 {
-                -snapshot_id
-            } else {
-                snapshot_id
-            }
-        };
-        let mut snapshot_id = generate_random_id();
-
-        while table
-            .metadata()
-            .snapshots()
-            .any(|s| s.snapshot_id() == snapshot_id)
-        {
-            snapshot_id = generate_random_id();
-        }
-        snapshot_id
     }
 
     fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
@@ -398,7 +496,8 @@ impl<'a> SnapshotWriter<'a> {
     async fn produce_manifests(
         &mut self,
         mut existing_manifests: Vec<ManifestFile>,
-    ) -> Result<Vec<ManifestFile>> {
+        cached_added_manifest: Option<ManifestFile>,
+    ) -> Result<(Vec<ManifestFile>, Option<ManifestFile>)> {
         // Assert current snapshot producer contains new content to add to new snapshot.
         //
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
@@ -412,11 +511,15 @@ impl<'a> SnapshotWriter<'a> {
         }
 
         // Process added entries.
-        if !self.added_data_files.is_empty() {
-            let added_manifest = self.write_added_manifest().await?;
-            existing_manifests.push(added_manifest);
-        }
-        Ok(existing_manifests)
+        let added_manifest = if self.added_data_files.is_empty() {
+            None
+        } else if let Some(manifest) = cached_added_manifest {
+            Some(manifest)
+        } else {
+            Some(self.write_added_manifest().await?)
+        };
+        existing_manifests.extend(added_manifest.iter().cloned());
+        Ok((existing_manifests, added_manifest))
     }
 
     // Returns a `Summary` of the current snapshot
@@ -485,8 +588,10 @@ impl<'a> SnapshotWriter<'a> {
         mut self,
         operation: Operation,
         existing_manifests: Vec<ManifestFile>,
-    ) -> Result<ActionCommit> {
-        let manifest_list_path = self.generate_manifest_list_file_path(0)?;
+        attempt: u64,
+        cached_added_manifest: Option<ManifestFile>,
+    ) -> Result<SnapshotWriteResult> {
+        let manifest_list_path = self.generate_manifest_list_file_path(attempt as i64)?;
         let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
 
@@ -530,7 +635,9 @@ impl<'a> SnapshotWriter<'a> {
             Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
         })?;
 
-        let new_manifests = self.produce_manifests(existing_manifests).await?;
+        let (new_manifests, added_data_manifest) = self
+            .produce_manifests(existing_manifests, cached_added_manifest)
+            .await?;
 
         manifest_list_writer.add_manifests(new_manifests.into_iter())?;
         let writer_next_row_id = manifest_list_writer.next_row_id();
@@ -538,7 +645,7 @@ impl<'a> SnapshotWriter<'a> {
 
         let commit_ts = chrono::Utc::now().timestamp_millis();
         let new_snapshot = Snapshot::builder()
-            .with_manifest_list(manifest_list_path)
+            .with_manifest_list(manifest_list_path.clone())
             .with_snapshot_id(self.snapshot_id)
             .with_parent_snapshot_id(self.table.metadata().current_snapshot_id())
             .with_sequence_number(next_seq_num)
@@ -595,6 +702,10 @@ impl<'a> SnapshotWriter<'a> {
             },
         ];
 
-        Ok(ActionCommit::new(updates, requirements))
+        Ok(SnapshotWriteResult {
+            action_commit: ActionCommit::new(updates, requirements),
+            manifest_list_path,
+            added_data_manifest,
+        })
     }
 }
