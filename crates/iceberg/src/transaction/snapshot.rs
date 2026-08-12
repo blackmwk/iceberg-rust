@@ -38,11 +38,21 @@ use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 #[derive(Default)]
 pub(crate) struct SnapshotChanges {
     added_data_files: Vec<DataFile>,
+    added_delete_files: Vec<DataFile>,
 }
 
 impl SnapshotChanges {
     pub(crate) fn new(added_data_files: Vec<DataFile>) -> Self {
-        Self { added_data_files }
+        Self {
+            added_data_files,
+            added_delete_files: Vec::new(),
+        }
+    }
+
+    #[allow(dead_code)] // Used by row-delta in a later stack layer.
+    pub(crate) fn with_added_delete_files(mut self, files: Vec<DataFile>) -> Self {
+        self.added_delete_files = files;
+        self
     }
 }
 
@@ -107,8 +117,10 @@ impl<'a> SnapshotCommitBuilder<'a> {
             commit_uuid,
             self.snapshot_properties,
             self.changes.added_data_files,
+            self.changes.added_delete_files,
         );
         writer.validate_added_data_files()?;
+        writer.validate_added_delete_files()?;
         if self.check_duplicate {
             writer.validate_duplicate_files().await?;
         }
@@ -118,10 +130,14 @@ impl<'a> SnapshotCommitBuilder<'a> {
                 existing_manifests,
                 attempt,
                 retry.added_data_manifest(),
+                retry.added_delete_manifest(),
             )
             .await?;
         if let Some(manifest) = result.added_data_manifest {
             retry.cache_added_data_manifest(manifest);
+        }
+        if let Some(manifest) = result.added_delete_manifest {
+            retry.cache_added_delete_manifest(manifest);
         }
         retry.track_manifest_list(result.manifest_list_path);
         Ok(result.action_commit)
@@ -274,6 +290,82 @@ mod change_set_tests {
                 .unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn writes_and_reuses_delete_manifests() {
+        let table = make_v2_minimal_table();
+        let delete_file = DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path("test/delete.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(50)
+            .record_count(1)
+            .equality_ids(Some(vec![1]))
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+        let mut retry = SnapshotRetryState::default();
+
+        let first = take_snapshot(
+            SnapshotCommitBuilder::new(
+                &table,
+                Operation::Delete,
+                None,
+                HashMap::new(),
+                SnapshotChanges::new(Vec::new()).with_added_delete_files(vec![delete_file.clone()]),
+            )
+            .commit(&mut retry)
+            .await
+            .unwrap(),
+        );
+        let second = take_snapshot(
+            SnapshotCommitBuilder::new(
+                &table,
+                Operation::Delete,
+                None,
+                HashMap::new(),
+                SnapshotChanges::new(Vec::new()).with_added_delete_files(vec![delete_file.clone()]),
+            )
+            .commit(&mut retry)
+            .await
+            .unwrap(),
+        );
+        let first_list = table.manifest_list_reader(&first).load().await.unwrap();
+        let second_list = table.manifest_list_reader(&second).load().await.unwrap();
+
+        assert_eq!(
+            first_list.entries()[0].content,
+            ManifestContentType::Deletes
+        );
+        assert_eq!(
+            first_list.entries()[0].manifest_path,
+            second_list.entries()[0].manifest_path
+        );
+        assert_eq!(
+            first
+                .summary()
+                .additional_properties
+                .get("added-delete-files")
+                .map(String::as_str),
+            Some("1")
+        );
+
+        let v1 = crate::transaction::tests::make_v1_table();
+        let result = SnapshotCommitBuilder::new(
+            &v1,
+            Operation::Delete,
+            None,
+            HashMap::new(),
+            SnapshotChanges::new(Vec::new()).with_added_delete_files(vec![delete_file]),
+        )
+        .commit(&mut SnapshotRetryState::default())
+        .await;
+        let Err(err) = result else {
+            panic!("format v1 must reject delete files")
+        };
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
 }
 
 struct SnapshotWriter<'a> {
@@ -282,6 +374,7 @@ struct SnapshotWriter<'a> {
     commit_uuid: Uuid,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    added_delete_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -292,6 +385,7 @@ struct SnapshotWriteResult {
     action_commit: ActionCommit,
     manifest_list_path: String,
     added_data_manifest: Option<ManifestFile>,
+    added_delete_manifest: Option<ManifestFile>,
 }
 
 impl<'a> SnapshotWriter<'a> {
@@ -301,6 +395,7 @@ impl<'a> SnapshotWriter<'a> {
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
+        added_delete_files: Vec<DataFile>,
     ) -> Self {
         Self {
             table,
@@ -308,6 +403,7 @@ impl<'a> SnapshotWriter<'a> {
             commit_uuid,
             snapshot_properties,
             added_data_files,
+            added_delete_files,
             manifest_counter: (0..),
         }
     }
@@ -333,6 +429,65 @@ impl<'a> SnapshotWriter<'a> {
             )?;
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn validate_added_delete_files(&self) -> Result<()> {
+        if !self.added_delete_files.is_empty()
+            && self.table.metadata().format_version() == FormatVersion::V1
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Delete files require table format version 2 or newer",
+            ));
+        }
+
+        let mut paths = self
+            .added_data_files
+            .iter()
+            .map(|file| file.file_path.as_str())
+            .collect::<HashSet<_>>();
+        for delete_file in &self.added_delete_files {
+            if !paths.insert(delete_file.file_path.as_str()) {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Cannot add duplicate file path {}", delete_file.file_path),
+                ));
+            }
+            if delete_file.content_type() == crate::spec::DataContentType::Data {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Only position or equality delete files can be added as delete files",
+                ));
+            }
+            if self.table.metadata().default_partition_spec_id() != delete_file.partition_spec_id {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Delete file partition spec id does not match table default partition spec id",
+                ));
+            }
+            Self::validate_partition_value(
+                delete_file.partition(),
+                self.table.metadata().default_partition_type(),
+            )?;
+            if delete_file.content_type() == crate::spec::DataContentType::EqualityDeletes {
+                let ids = delete_file.equality_ids().unwrap_or_default();
+                if ids.is_empty()
+                    || ids.iter().any(|id| {
+                        self.table
+                            .metadata()
+                            .current_schema()
+                            .field_by_id(*id)
+                            .is_none()
+                    })
+                {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "Equality delete file must reference known equality field ids",
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -491,19 +646,42 @@ impl<'a> SnapshotWriter<'a> {
         writer.write_manifest_file().await
     }
 
+    async fn write_added_delete_manifest(&mut self) -> Result<ManifestFile> {
+        let files = std::mem::take(&mut self.added_delete_files);
+        let entries = files.into_iter().map(|file| {
+            ManifestEntry::builder()
+                .status(crate::spec::ManifestStatus::Added)
+                .data_file(file)
+                .build()
+        });
+        let mut writer = self.new_manifest_writer(ManifestContentType::Deletes)?;
+        for entry in entries {
+            writer.add_entry(entry)?;
+        }
+        writer.write_manifest_file().await
+    }
+
     /// Creates new manifests for data files added or removed,
     /// and collects all of the manifests to be included in the new snapshot as [ManifestFile] entries.
     async fn produce_manifests(
         &mut self,
         mut existing_manifests: Vec<ManifestFile>,
         cached_added_manifest: Option<ManifestFile>,
-    ) -> Result<(Vec<ManifestFile>, Option<ManifestFile>)> {
+        cached_delete_manifest: Option<ManifestFile>,
+    ) -> Result<(
+        Vec<ManifestFile>,
+        Option<ManifestFile>,
+        Option<ManifestFile>,
+    )> {
         // Assert current snapshot producer contains new content to add to new snapshot.
         //
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        if self.added_data_files.is_empty() && self.snapshot_properties.is_empty() {
+        if self.added_data_files.is_empty()
+            && self.added_delete_files.is_empty()
+            && self.snapshot_properties.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
                 "No added data files or added snapshot properties found when write a manifest file",
@@ -519,7 +697,15 @@ impl<'a> SnapshotWriter<'a> {
             Some(self.write_added_manifest().await?)
         };
         existing_manifests.extend(added_manifest.iter().cloned());
-        Ok((existing_manifests, added_manifest))
+        let delete_manifest = if self.added_delete_files.is_empty() {
+            None
+        } else if let Some(manifest) = cached_delete_manifest {
+            Some(manifest)
+        } else {
+            Some(self.write_added_delete_manifest().await?)
+        };
+        existing_manifests.extend(delete_manifest.iter().cloned());
+        Ok((existing_manifests, added_manifest, delete_manifest))
     }
 
     // Returns a `Summary` of the current snapshot
@@ -545,6 +731,13 @@ impl<'a> SnapshotWriter<'a> {
         for data_file in &self.added_data_files {
             summary_collector.add_file(
                 data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+        for delete_file in &self.added_delete_files {
+            summary_collector.add_file(
+                delete_file,
                 table_metadata.current_schema().clone(),
                 table_metadata.default_partition_spec().clone(),
             );
@@ -590,6 +783,7 @@ impl<'a> SnapshotWriter<'a> {
         existing_manifests: Vec<ManifestFile>,
         attempt: u64,
         cached_added_manifest: Option<ManifestFile>,
+        cached_delete_manifest: Option<ManifestFile>,
     ) -> Result<SnapshotWriteResult> {
         let manifest_list_path = self.generate_manifest_list_file_path(attempt as i64)?;
         let next_seq_num = self.table.metadata().next_sequence_number();
@@ -635,8 +829,12 @@ impl<'a> SnapshotWriter<'a> {
             Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
         })?;
 
-        let (new_manifests, added_data_manifest) = self
-            .produce_manifests(existing_manifests, cached_added_manifest)
+        let (new_manifests, added_data_manifest, added_delete_manifest) = self
+            .produce_manifests(
+                existing_manifests,
+                cached_added_manifest,
+                cached_delete_manifest,
+            )
             .await?;
 
         manifest_list_writer.add_manifests(new_manifests.into_iter())?;
@@ -706,6 +904,7 @@ impl<'a> SnapshotWriter<'a> {
             action_commit: ActionCommit::new(updates, requirements),
             manifest_list_path,
             added_data_manifest,
+            added_delete_manifest,
         })
     }
 }

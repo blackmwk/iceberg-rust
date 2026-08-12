@@ -74,6 +74,7 @@ pub(crate) struct SnapshotRetryState {
     snapshot_id: Option<i64>,
     attempt: u64,
     added_data_manifest: Option<ManifestFile>,
+    added_delete_manifest: Option<ManifestFile>,
     owned_artifacts: HashSet<String>,
     #[cfg(test)]
     manifest_list_loads: usize,
@@ -108,6 +109,7 @@ impl SnapshotRetryState {
         }
         self.snapshot_id = Some(snapshot_id);
         self.added_data_manifest = None;
+        self.added_delete_manifest = None;
         snapshot_id
     }
 
@@ -124,6 +126,15 @@ impl SnapshotRetryState {
     pub(crate) fn cache_added_data_manifest(&mut self, manifest: ManifestFile) {
         self.owned_artifacts.insert(manifest.manifest_path.clone());
         self.added_data_manifest = Some(manifest);
+    }
+
+    pub(crate) fn added_delete_manifest(&self) -> Option<ManifestFile> {
+        self.added_delete_manifest.clone()
+    }
+
+    pub(crate) fn cache_added_delete_manifest(&mut self, manifest: ManifestFile) {
+        self.owned_artifacts.insert(manifest.manifest_path.clone());
+        self.added_delete_manifest = Some(manifest);
     }
 
     pub(crate) fn track_manifest_list(&mut self, path: String) {
