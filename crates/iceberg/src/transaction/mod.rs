@@ -56,6 +56,7 @@ pub use action::*;
 mod append;
 mod delete_files;
 mod expire_snapshots;
+mod overwrite_files;
 #[allow(dead_code)] // Used by snapshot actions in later stack layers.
 mod retry;
 mod rewrite_files;
@@ -82,6 +83,7 @@ use crate::transaction::action::TransactionActionEntry;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::delete_files::DeleteFilesAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::overwrite_files::OverwriteFilesAction;
 pub use crate::transaction::rewrite_files::RewriteFilesAction;
 pub use crate::transaction::row_delta::RowDeltaAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
@@ -185,6 +187,11 @@ impl Transaction {
     /// Create an action that atomically replaces data and delete files.
     pub fn rewrite_files(&self) -> RewriteFilesAction {
         RewriteFilesAction::new(self.table.metadata().current_snapshot_id())
+    }
+
+    /// Create an action that overwrites data using explicit files or a row filter.
+    pub fn overwrite_files(&self) -> OverwriteFilesAction {
+        OverwriteFilesAction::new(self.table.metadata().current_snapshot_id())
     }
 
     /// Creates replace sort order action.
