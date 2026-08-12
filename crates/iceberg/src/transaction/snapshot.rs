@@ -42,6 +42,7 @@ pub(crate) struct SnapshotChanges {
     removed_data_paths: HashSet<String>,
     removed_delete_paths: HashSet<String>,
     fail_missing_files: bool,
+    data_sequence_number: Option<i64>,
 }
 
 impl SnapshotChanges {
@@ -52,6 +53,7 @@ impl SnapshotChanges {
             removed_data_paths: HashSet::new(),
             removed_delete_paths: HashSet::new(),
             fail_missing_files: true,
+            data_sequence_number: None,
         }
     }
 
@@ -87,6 +89,12 @@ impl SnapshotChanges {
     #[allow(dead_code)] // Used by path-based delete actions in later stack layers.
     pub(crate) fn with_fail_missing_files(mut self, fail: bool) -> Self {
         self.fail_missing_files = fail;
+        self
+    }
+
+    #[allow(dead_code)] // Used by rewrite actions in a later stack layer.
+    pub(crate) fn with_data_sequence_number(mut self, sequence_number: Option<i64>) -> Self {
+        self.data_sequence_number = sequence_number;
         self
     }
 }
@@ -492,6 +500,7 @@ struct SnapshotWriter<'a> {
     removed_data_files: Vec<DataFile>,
     removed_delete_files: Vec<DataFile>,
     fail_missing_files: bool,
+    data_sequence_number: Option<i64>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -525,6 +534,7 @@ impl<'a> SnapshotWriter<'a> {
             removed_data_files: Vec::new(),
             removed_delete_files: Vec::new(),
             fail_missing_files: changes.fail_missing_files,
+            data_sequence_number: changes.data_sequence_number,
             manifest_counter: (0..),
         }
     }
@@ -886,10 +896,12 @@ impl<'a> SnapshotWriter<'a> {
 
         let snapshot_id = self.snapshot_id;
         let format_version = self.table.metadata().format_version();
+        let data_sequence_number = self.data_sequence_number;
         let manifest_entries = added_data_files.into_iter().map(|data_file| {
             let builder = ManifestEntry::builder()
                 .status(crate::spec::ManifestStatus::Added)
-                .data_file(data_file);
+                .data_file(data_file)
+                .sequence_number_opt(data_sequence_number);
             if format_version == FormatVersion::V1 {
                 builder.snapshot_id(snapshot_id).build()
             } else {

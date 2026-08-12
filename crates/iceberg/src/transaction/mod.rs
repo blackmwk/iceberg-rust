@@ -58,6 +58,7 @@ mod delete_files;
 mod expire_snapshots;
 #[allow(dead_code)] // Used by snapshot actions in later stack layers.
 mod retry;
+mod rewrite_files;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -81,6 +82,7 @@ use crate::transaction::action::TransactionActionEntry;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::delete_files::DeleteFilesAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::rewrite_files::RewriteFilesAction;
 pub use crate::transaction::row_delta::RowDeltaAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
@@ -178,6 +180,11 @@ impl Transaction {
     /// Create a merge-on-read row delta action.
     pub fn row_delta(&self) -> RowDeltaAction {
         RowDeltaAction::new(self.table.metadata().current_snapshot_id())
+    }
+
+    /// Create an action that atomically replaces data and delete files.
+    pub fn rewrite_files(&self) -> RewriteFilesAction {
+        RewriteFilesAction::new(self.table.metadata().current_snapshot_id())
     }
 
     /// Creates replace sort order action.
