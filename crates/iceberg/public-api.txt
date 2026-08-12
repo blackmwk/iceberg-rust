@@ -3265,6 +3265,11 @@ pub fn iceberg::transaction::OverwriteFilesAction::validate_added_files_match_ov
 pub fn iceberg::transaction::OverwriteFilesAction::validate_from_snapshot(self, snapshot_id: i64) -> Self
 pub fn iceberg::transaction::OverwriteFilesAction::validate_no_conflicting_data_files(self) -> Self
 pub fn iceberg::transaction::OverwriteFilesAction::validate_no_conflicting_delete_files(self) -> Self
+pub struct iceberg::transaction::ReplacePartitionsAction
+impl iceberg::transaction::ReplacePartitionsAction
+pub fn iceberg::transaction::ReplacePartitionsAction::add_data_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
+pub fn iceberg::transaction::ReplacePartitionsAction::set_commit_uuid(self, commit_uuid: uuid::Uuid) -> Self
+pub fn iceberg::transaction::ReplacePartitionsAction::set_snapshot_properties(self, properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
 pub struct iceberg::transaction::ReplaceSortOrderAction
 impl iceberg::transaction::ReplaceSortOrderAction
 pub fn iceberg::transaction::ReplaceSortOrderAction::asc(self, name: &str, null_order: iceberg::spec::NullOrder) -> Self
@@ -3299,6 +3304,7 @@ pub fn iceberg::transaction::Transaction::expire_snapshots(&self) -> iceberg::tr
 pub fn iceberg::transaction::Transaction::fast_append(&self) -> iceberg::transaction::FastAppendAction
 pub fn iceberg::transaction::Transaction::new(table: &iceberg::table::Table) -> Self
 pub fn iceberg::transaction::Transaction::overwrite_files(&self) -> iceberg::transaction::OverwriteFilesAction
+pub fn iceberg::transaction::Transaction::replace_partitions(&self) -> iceberg::transaction::ReplacePartitionsAction
 pub fn iceberg::transaction::Transaction::replace_sort_order(&self) -> iceberg::transaction::ReplaceSortOrderAction
 pub fn iceberg::transaction::Transaction::rewrite_files(&self) -> iceberg::transaction::RewriteFilesAction
 pub fn iceberg::transaction::Transaction::row_delta(&self) -> iceberg::transaction::RowDeltaAction
