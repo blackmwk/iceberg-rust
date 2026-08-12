@@ -32,7 +32,161 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
+use crate::transaction::retry::SnapshotRetryState;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
+
+/// Immutable files to apply in a snapshot-producing action.
+#[derive(Default)]
+#[allow(dead_code)] // Fast append is migrated in the next stack layer.
+pub(crate) struct SnapshotChanges {
+    added_data_files: Vec<DataFile>,
+}
+
+#[allow(dead_code)] // Fast append is migrated in the next stack layer.
+impl SnapshotChanges {
+    pub(crate) fn new(added_data_files: Vec<DataFile>) -> Self {
+        Self { added_data_files }
+    }
+}
+
+/// Retry-aware entry point for producing a snapshot from an explicit change set.
+#[allow(dead_code)] // Fast append is migrated in the next stack layer.
+pub(crate) struct SnapshotCommitBuilder<'a> {
+    table: &'a Table,
+    operation: Operation,
+    commit_uuid: Uuid,
+    snapshot_properties: HashMap<String, String>,
+    changes: SnapshotChanges,
+}
+
+#[allow(dead_code)] // Fast append is migrated in the next stack layer.
+impl<'a> SnapshotCommitBuilder<'a> {
+    pub(crate) fn new(
+        table: &'a Table,
+        operation: Operation,
+        commit_uuid: Uuid,
+        snapshot_properties: HashMap<String, String>,
+        changes: SnapshotChanges,
+    ) -> Self {
+        Self {
+            table,
+            operation,
+            commit_uuid,
+            snapshot_properties,
+            changes,
+        }
+    }
+
+    pub(crate) async fn commit(self, retry: &mut SnapshotRetryState) -> Result<ActionCommit> {
+        let existing_manifests = retry
+            .process_current_snapshot(self.table)
+            .await?
+            .map(|snapshot| {
+                snapshot
+                    .data_manifests()
+                    .iter()
+                    .chain(snapshot.delete_manifests())
+                    .filter(|manifest| {
+                        manifest.has_added_files()
+                            || manifest.has_existing_files()
+                            || manifest.has_deleted_files()
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let producer = SnapshotProducer::new(
+            self.table,
+            self.commit_uuid,
+            self.snapshot_properties,
+            self.changes.added_data_files,
+        );
+        producer.validate_added_data_files()?;
+        producer
+            .commit(
+                ChangeSetOperation {
+                    operation: self.operation,
+                    existing_manifests,
+                },
+                DefaultManifestProcess,
+            )
+            .await
+    }
+}
+
+struct ChangeSetOperation {
+    operation: Operation,
+    existing_manifests: Vec<ManifestFile>,
+}
+
+impl SnapshotProduceOperation for ChangeSetOperation {
+    fn operation(&self) -> Operation {
+        self.operation.clone()
+    }
+
+    async fn delete_entries(&self, _producer: &SnapshotProducer<'_>) -> Result<Vec<ManifestEntry>> {
+        Ok(Vec::new())
+    }
+
+    async fn existing_manifest(
+        &self,
+        _producer: &SnapshotProducer<'_>,
+    ) -> Result<Vec<ManifestFile>> {
+        Ok(self.existing_manifests.clone())
+    }
+}
+
+#[cfg(test)]
+mod change_set_tests {
+    use super::*;
+    use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
+    use crate::transaction::tests::make_v2_minimal_table;
+
+    #[tokio::test]
+    async fn commits_added_data_files_from_change_set() {
+        let table = make_v2_minimal_table();
+        let file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/added.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+        let mut retry = SnapshotRetryState::default();
+
+        let mut commit = SnapshotCommitBuilder::new(
+            &table,
+            Operation::Append,
+            Uuid::now_v7(),
+            HashMap::new(),
+            SnapshotChanges::new(vec![file]),
+        )
+        .commit(&mut retry)
+        .await
+        .unwrap();
+
+        let snapshot = commit
+            .take_updates()
+            .into_iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(snapshot.summary().operation, Operation::Append);
+        assert_eq!(
+            snapshot
+                .summary()
+                .additional_properties
+                .get("added-data-files"),
+            Some(&"1".to_string())
+        );
+    }
+}
 
 /// A trait that defines how different table operations produce new snapshots.
 ///

@@ -73,6 +73,56 @@ pub(crate) struct SnapshotRetryState {
 }
 
 impl SnapshotRetryState {
+    async fn load_snapshot(&mut self, table: &Table, snapshot: &SnapshotRef) -> Result<bool> {
+        let snapshot_id = snapshot.snapshot_id();
+        let fingerprint = SnapshotFingerprint::from(snapshot);
+        if let Some(processed) = self.processed_snapshots.get(&snapshot_id) {
+            if processed.fingerprint != fingerprint {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Snapshot {snapshot_id} changed while retrying a commit"),
+                ));
+            }
+            return Ok(false);
+        }
+
+        let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+        #[cfg(test)]
+        {
+            self.manifest_list_loads += 1;
+        }
+
+        let mut data_manifests = Vec::new();
+        let mut delete_manifests = Vec::new();
+        for manifest in manifest_list.consume_entries() {
+            match manifest.content {
+                ManifestContentType::Data => data_manifests.push(manifest),
+                ManifestContentType::Deletes => delete_manifests.push(manifest),
+            }
+        }
+
+        self.processed_snapshots
+            .insert(snapshot_id, ProcessedSnapshot {
+                fingerprint,
+                operation: snapshot.summary().operation.clone(),
+                data_manifests,
+                delete_manifests,
+            });
+        Ok(true)
+    }
+
+    pub(crate) async fn process_current_snapshot(
+        &mut self,
+        table: &Table,
+    ) -> Result<Option<&ProcessedSnapshot>> {
+        let Some(current) = table.metadata().current_snapshot().cloned() else {
+            return Ok(None);
+        };
+        let snapshot_id = current.snapshot_id();
+        self.load_snapshot(table, &current).await?;
+        Ok(self.processed(snapshot_id))
+    }
+
     /// Load history from the current snapshot back to `starting_snapshot_id`
     /// (exclusive), returning snapshot IDs whose manifest lists were loaded by
     /// this call in head-to-root order.
@@ -100,37 +150,7 @@ impl SnapshotRetryState {
                 ));
             }
 
-            let fingerprint = SnapshotFingerprint::from(&current);
-            if let Some(processed) = self.processed_snapshots.get(&snapshot_id) {
-                if processed.fingerprint != fingerprint {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Snapshot {snapshot_id} changed while retrying a commit"),
-                    ));
-                }
-            } else {
-                let manifest_list = table.manifest_list_reader(&current).load().await?;
-                #[cfg(test)]
-                {
-                    self.manifest_list_loads += 1;
-                }
-
-                let mut data_manifests = Vec::new();
-                let mut delete_manifests = Vec::new();
-                for manifest in manifest_list.consume_entries() {
-                    match manifest.content {
-                        ManifestContentType::Data => data_manifests.push(manifest),
-                        ManifestContentType::Deletes => delete_manifests.push(manifest),
-                    }
-                }
-
-                self.processed_snapshots
-                    .insert(snapshot_id, ProcessedSnapshot {
-                        fingerprint,
-                        operation: current.summary().operation.clone(),
-                        data_manifests,
-                        delete_manifests,
-                    });
+            if self.load_snapshot(table, &current).await? {
                 newly_processed.push(snapshot_id);
             }
 
