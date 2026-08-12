@@ -46,6 +46,8 @@ pub(crate) struct ProcessedSnapshot {
     operation: Operation,
     data_manifests: Vec<ManifestFile>,
     delete_manifests: Vec<ManifestFile>,
+    introduced_data_manifests: Vec<ManifestFile>,
+    introduced_delete_manifests: Vec<ManifestFile>,
 }
 
 impl ProcessedSnapshot {
@@ -59,6 +61,14 @@ impl ProcessedSnapshot {
 
     pub(crate) fn delete_manifests(&self) -> &[ManifestFile] {
         &self.delete_manifests
+    }
+
+    pub(crate) fn introduced_data_manifests(&self) -> &[ManifestFile] {
+        &self.introduced_data_manifests
+    }
+
+    pub(crate) fn introduced_delete_manifests(&self) -> &[ManifestFile] {
+        &self.introduced_delete_manifests
     }
 }
 
@@ -237,6 +247,16 @@ impl SnapshotRetryState {
             .insert(snapshot_id, ProcessedSnapshot {
                 fingerprint,
                 operation: snapshot.summary().operation.clone(),
+                introduced_data_manifests: data_manifests
+                    .iter()
+                    .filter(|manifest| manifest.added_snapshot_id == snapshot_id)
+                    .cloned()
+                    .collect(),
+                introduced_delete_manifests: delete_manifests
+                    .iter()
+                    .filter(|manifest| manifest.added_snapshot_id == snapshot_id)
+                    .cloned()
+                    .collect(),
                 data_manifests,
                 delete_manifests,
             });
@@ -309,6 +329,29 @@ impl SnapshotRetryState {
         self.processed_snapshots.get(&snapshot_id)
     }
 
+    /// Return snapshot IDs from the current snapshot back to `starting_snapshot_id`
+    /// (exclusive). Manifest lists already processed by an earlier attempt are reused.
+    pub(crate) async fn validation_history(
+        &mut self,
+        table: &Table,
+        starting_snapshot_id: Option<i64>,
+    ) -> Result<Vec<i64>> {
+        self.process_new_snapshots(table, starting_snapshot_id)
+            .await?;
+        let mut history = Vec::new();
+        let mut current = table.metadata().current_snapshot();
+        while let Some(snapshot) = current {
+            if Some(snapshot.snapshot_id()) == starting_snapshot_id {
+                break;
+            }
+            history.push(snapshot.snapshot_id());
+            current = snapshot
+                .parent_snapshot_id()
+                .and_then(|id| table.metadata().snapshot_by_id(id));
+        }
+        Ok(history)
+    }
+
     #[cfg(test)]
     fn manifest_list_loads(&self) -> usize {
         self.manifest_list_loads
@@ -357,6 +400,10 @@ mod tests {
 
         let retry = state.process_new_snapshots(&table, None).await.unwrap();
         assert!(retry.is_empty());
+        assert_eq!(state.manifest_list_loads(), 2);
+
+        let history = state.validation_history(&table, None).await.unwrap();
+        assert_eq!(history.len(), 2);
         assert_eq!(state.manifest_list_loads(), 2);
     }
 
