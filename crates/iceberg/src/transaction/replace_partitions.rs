@@ -20,10 +20,12 @@ use std::collections::{HashMap, HashSet};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::spec::{DataFile, ManifestContentType, Operation, Struct};
+use crate::expr::{Predicate, Reference};
+use crate::spec::{DataFile, Datum, ManifestContentType, Operation, Struct};
 use crate::table::Table;
 use crate::transaction::retry::SnapshotRetryState;
 use crate::transaction::snapshot::{SnapshotChanges, SnapshotCommitBuilder};
+use crate::transaction::validate::{ConflictFilter, SnapshotValidation};
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind, Result};
 
@@ -32,8 +34,10 @@ pub struct ReplacePartitionsAction {
     added_data_files: Vec<DataFile>,
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
-    #[allow(dead_code)] // Used by replace-partitions validation in the next stack layer.
     pub(crate) starting_snapshot_id: Option<i64>,
+    append_only: bool,
+    validate_conflicts: bool,
+    case_sensitive: bool,
 }
 
 impl ReplacePartitionsAction {
@@ -43,6 +47,9 @@ impl ReplacePartitionsAction {
             commit_uuid: None,
             snapshot_properties: HashMap::new(),
             starting_snapshot_id,
+            append_only: false,
+            validate_conflicts: true,
+            case_sensitive: true,
         }
     }
 
@@ -62,6 +69,69 @@ impl ReplacePartitionsAction {
     pub fn set_snapshot_properties(mut self, properties: HashMap<String, String>) -> Self {
         self.snapshot_properties = properties;
         self
+    }
+
+    /// Fail if any target partition already contains live data.
+    pub fn append_only(mut self) -> Self {
+        self.append_only = true;
+        self
+    }
+
+    /// Set the snapshot boundary used for conflict validation.
+    pub fn validate_from_snapshot(mut self, snapshot_id: i64) -> Self {
+        self.starting_snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Configure case-sensitive conflict-filter binding.
+    pub fn case_sensitive(mut self, case_sensitive: bool) -> Self {
+        self.case_sensitive = case_sensitive;
+        self
+    }
+
+    /// Disable concurrent data/delete conflict validation.
+    pub fn skip_conflict_validation(mut self) -> Self {
+        self.validate_conflicts = false;
+        self
+    }
+
+    fn target_filter(&self, table: &Table, targets: &HashSet<(i32, Struct)>) -> Result<Predicate> {
+        let spec = table.metadata().default_partition_spec();
+        let mut filter = Predicate::AlwaysFalse;
+        for (_, partition) in targets {
+            let mut target = Predicate::AlwaysTrue;
+            for (field, value) in spec.fields().iter().zip(partition.fields()) {
+                let Some(value) = value else {
+                    target = target.and(Reference::new(field.name.clone()).is_null());
+                    continue;
+                };
+                let primitive_type = value.as_primitive_literal().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Replacement partition values must be primitive",
+                    )
+                })?;
+                let partition_type = table
+                    .metadata()
+                    .default_partition_type()
+                    .fields()
+                    .iter()
+                    .find(|partition_field| partition_field.name == field.name)
+                    .and_then(|partition_field| {
+                        partition_field.field_type.as_primitive_type().cloned()
+                    })
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            "Invalid replacement partition field",
+                        )
+                    })?;
+                let datum = Datum::new(partition_type, primitive_type);
+                target = target.and(Reference::new(field.name.clone()).equal_to(datum));
+            }
+            filter = filter.or(target);
+        }
+        Ok(filter)
     }
 
     fn targets(&self, table: &Table) -> Result<HashSet<(i32, Struct)>> {
@@ -128,6 +198,23 @@ impl ReplacePartitionsAction {
                     destination.push(file.clone());
                 }
             }
+        }
+
+        if self.append_only && !removed_data.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Append-only replace partitions cannot overwrite an existing partition",
+            ));
+        }
+        if self.validate_conflicts {
+            let filter = ConflictFilter::new(
+                table,
+                self.target_filter(table, &targets)?,
+                self.case_sensitive,
+            )?;
+            SnapshotValidation::from_snapshot(self.starting_snapshot_id)
+                .validate_no_conflicting_files(table, retry, &filter, true, true, true)
+                .await?;
         }
 
         SnapshotCommitBuilder::new(
@@ -239,5 +326,42 @@ mod tests {
         assert!(paths.contains("new-target.parquet"));
         assert!(paths.contains("old-other.parquet"));
         assert!(!paths.contains("old-target.parquet"));
+    }
+
+    #[tokio::test]
+    async fn append_only_rejects_existing_target_partition() {
+        let base = make_v2_minimal_table();
+        let append = Arc::new(Transaction::new(&base).fast_append().add_data_files([file(
+            &base,
+            "old.parquet",
+            300,
+        )]))
+        .commit(&mut SnapshotRetryState::default(), &base)
+        .await
+        .unwrap();
+        let table = Transaction::apply(base, append, &mut Vec::new(), &mut Vec::new()).unwrap();
+        let result = Arc::new(
+            Transaction::new(&table)
+                .replace_partitions()
+                .append_only()
+                .add_data_files([file(&table, "new.parquet", 300)]),
+        )
+        .commit(&mut SnapshotRetryState::default(), &table)
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_non_ancestor_validation_start() {
+        let table = make_v2_minimal_table();
+        let result = Arc::new(
+            Transaction::new(&table)
+                .replace_partitions()
+                .validate_from_snapshot(i64::MAX)
+                .add_data_files([file(&table, "new.parquet", 300)]),
+        )
+        .commit(&mut SnapshotRetryState::default(), &table)
+        .await;
+        assert!(result.is_err());
     }
 }
