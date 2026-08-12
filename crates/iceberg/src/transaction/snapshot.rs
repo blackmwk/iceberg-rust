@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::ops::RangeFrom;
 
 use futures::TryStreamExt;
@@ -37,12 +36,10 @@ use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 /// Immutable files to apply in a snapshot-producing action.
 #[derive(Default)]
-#[allow(dead_code)] // Fast append is migrated in the next stack layer.
 pub(crate) struct SnapshotChanges {
     added_data_files: Vec<DataFile>,
 }
 
-#[allow(dead_code)] // Fast append is migrated in the next stack layer.
 impl SnapshotChanges {
     pub(crate) fn new(added_data_files: Vec<DataFile>) -> Self {
         Self { added_data_files }
@@ -50,16 +47,15 @@ impl SnapshotChanges {
 }
 
 /// Retry-aware entry point for producing a snapshot from an explicit change set.
-#[allow(dead_code)] // Fast append is migrated in the next stack layer.
 pub(crate) struct SnapshotCommitBuilder<'a> {
     table: &'a Table,
     operation: Operation,
     commit_uuid: Uuid,
     snapshot_properties: HashMap<String, String>,
     changes: SnapshotChanges,
+    check_duplicate: bool,
 }
 
-#[allow(dead_code)] // Fast append is migrated in the next stack layer.
 impl<'a> SnapshotCommitBuilder<'a> {
     pub(crate) fn new(
         table: &'a Table,
@@ -74,7 +70,13 @@ impl<'a> SnapshotCommitBuilder<'a> {
             commit_uuid,
             snapshot_properties,
             changes,
+            check_duplicate: true,
         }
+    }
+
+    pub(crate) fn with_check_duplicate(mut self, check_duplicate: bool) -> Self {
+        self.check_duplicate = check_duplicate;
+        self
     }
 
     pub(crate) async fn commit(self, retry: &mut SnapshotRetryState) -> Result<ActionCommit> {
@@ -96,44 +98,17 @@ impl<'a> SnapshotCommitBuilder<'a> {
             })
             .unwrap_or_default();
 
-        let producer = SnapshotProducer::new(
+        let writer = SnapshotWriter::new(
             self.table,
             self.commit_uuid,
             self.snapshot_properties,
             self.changes.added_data_files,
         );
-        producer.validate_added_data_files()?;
-        producer
-            .commit(
-                ChangeSetOperation {
-                    operation: self.operation,
-                    existing_manifests,
-                },
-                DefaultManifestProcess,
-            )
-            .await
-    }
-}
-
-struct ChangeSetOperation {
-    operation: Operation,
-    existing_manifests: Vec<ManifestFile>,
-}
-
-impl SnapshotProduceOperation for ChangeSetOperation {
-    fn operation(&self) -> Operation {
-        self.operation.clone()
-    }
-
-    async fn delete_entries(&self, _producer: &SnapshotProducer<'_>) -> Result<Vec<ManifestEntry>> {
-        Ok(Vec::new())
-    }
-
-    async fn existing_manifest(
-        &self,
-        _producer: &SnapshotProducer<'_>,
-    ) -> Result<Vec<ManifestFile>> {
-        Ok(self.existing_manifests.clone())
+        writer.validate_added_data_files()?;
+        if self.check_duplicate {
+            writer.validate_duplicate_files().await?;
+        }
+        writer.commit(self.operation, existing_manifests).await
     }
 }
 
@@ -188,81 +163,8 @@ mod change_set_tests {
     }
 }
 
-/// A trait that defines how different table operations produce new snapshots.
-///
-/// `SnapshotProduceOperation` is used by [`SnapshotProducer`] to customize snapshot creation
-/// based on the type of operation being performed (e.g., `Append`, `Overwrite`, `Delete`, etc.).
-/// Each operation type implements this trait to specify:
-/// - Which operation type to record in the snapshot summary
-/// - Which existing manifest files should be included in the new snapshot
-/// - Which manifest entries should be marked as deleted
-///
-/// # When it accomplishes
-///
-/// This trait is used during the snapshot creation process in [`SnapshotProducer::commit()`]:
-///
-/// 1. **Operation Type Recording**: The `operation()` method determines which operation type
-///    (e.g., `Operation::Append`, `Operation::Overwrite`) is recorded in the snapshot summary.
-///    This metadata helps track what kind of change was made to the table.
-///
-/// 2. **Manifest File Selection**: The `existing_manifest()` method determines which existing
-///    manifest files from the current snapshot should be carried forward to the new snapshot.
-///    For example:
-///    - An `Append` operation typically includes all existing manifests plus new ones
-///    - An `Overwrite` operation might exclude manifests for partitions being overwritten
-///
-/// 3. **Delete Entry Processing**: The `delete_entries()` method is intended for future delete
-///    operations to specify which manifest entries should be marked as deleted.
-pub(crate) trait SnapshotProduceOperation: Send + Sync {
-    /// Returns the operation type that will be recorded in the snapshot summary.
-    ///
-    /// This determines what kind of operation is being performed (e.g., `Append`, `Overwrite`),
-    /// which is stored in the snapshot metadata for tracking and auditing purposes.
-    fn operation(&self) -> Operation;
-
-    /// Returns manifest entries that should be marked as deleted in the new snapshot.
-    #[allow(unused)]
-    fn delete_entries(
-        &self,
-        snapshot_produce: &SnapshotProducer,
-    ) -> impl Future<Output = Result<Vec<ManifestEntry>>> + Send;
-
-    /// Returns existing manifest files that should be included in the new snapshot.
-    ///
-    /// This method determines which manifest files from the current snapshot should be
-    /// carried forward to the new snapshot. The selection depends on the operation type:
-    ///
-    /// - **Append operations**: Typically include all existing manifests
-    /// - **Overwrite operations**: May exclude manifests for partitions being overwritten
-    /// - **Delete operations**: May exclude manifests for partitions being deleted
-    fn existing_manifest(
-        &self,
-        snapshot_produce: &SnapshotProducer<'_>,
-    ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
-}
-
-pub(crate) struct DefaultManifestProcess;
-
-impl ManifestProcess for DefaultManifestProcess {
-    fn process_manifests(
-        &self,
-        _snapshot_produce: &SnapshotProducer<'_>,
-        manifests: Vec<ManifestFile>,
-    ) -> Vec<ManifestFile> {
-        manifests
-    }
-}
-
-pub(crate) trait ManifestProcess: Send + Sync {
-    fn process_manifests(
-        &self,
-        snapshot_produce: &SnapshotProducer<'_>,
-        manifests: Vec<ManifestFile>,
-    ) -> Vec<ManifestFile>;
-}
-
-pub(crate) struct SnapshotProducer<'a> {
-    pub(crate) table: &'a Table,
+struct SnapshotWriter<'a> {
+    table: &'a Table,
     snapshot_id: i64,
     commit_uuid: Uuid,
     snapshot_properties: HashMap<String, String>,
@@ -273,8 +175,8 @@ pub(crate) struct SnapshotProducer<'a> {
     manifest_counter: RangeFrom<u64>,
 }
 
-impl<'a> SnapshotProducer<'a> {
-    pub(crate) fn new(
+impl<'a> SnapshotWriter<'a> {
+    fn new(
         table: &'a Table,
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
@@ -493,10 +395,9 @@ impl<'a> SnapshotProducer<'a> {
 
     /// Creates new manifests for data files added or removed,
     /// and collects all of the manifests to be included in the new snapshot as [ManifestFile] entries.
-    async fn produce_manifests<OP: SnapshotProduceOperation, MP: ManifestProcess>(
+    async fn produce_manifests(
         &mut self,
-        snapshot_produce_operation: &OP,
-        manifest_process: &MP,
+        mut existing_manifests: Vec<ManifestFile>,
     ) -> Result<Vec<ManifestFile>> {
         // Assert current snapshot producer contains new content to add to new snapshot.
         //
@@ -510,27 +411,16 @@ impl<'a> SnapshotProducer<'a> {
             ));
         }
 
-        let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
-        let mut manifest_files = existing_manifests;
-
         // Process added entries.
         if !self.added_data_files.is_empty() {
             let added_manifest = self.write_added_manifest().await?;
-            manifest_files.push(added_manifest);
+            existing_manifests.push(added_manifest);
         }
-
-        // # TODO
-        // Support process delete entries.
-
-        let manifest_files = manifest_process.process_manifests(self, manifest_files);
-        Ok(manifest_files)
+        Ok(existing_manifests)
     }
 
     // Returns a `Summary` of the current snapshot
-    fn summary<OP: SnapshotProduceOperation>(
-        &self,
-        snapshot_produce_operation: &OP,
-    ) -> Result<Summary> {
+    fn summary(&self, operation: &Operation) -> Result<Summary> {
         let mut summary_collector = SnapshotSummaryCollector::default();
         let table_metadata = self.table.metadata_ref();
 
@@ -561,21 +451,21 @@ impl<'a> SnapshotProducer<'a> {
 
         // User-supplied snapshot properties are applied first, then the computed
         // metrics overwrite any colliding keys. This matches iceberg-java
-        // (`SnapshotProducer.summary`), where computed `added-*`/`total-*` values
+        // (the Java `SnapshotProducer.summary`), where computed `added-*`/`total-*` values
         // are written after user properties so a user cannot shadow them with a
         // bad (or merely wrong) value that would corrupt the snapshot summary.
         let mut additional_properties = self.snapshot_properties.clone();
         additional_properties.extend(summary_collector.build());
 
         let summary = Summary {
-            operation: snapshot_produce_operation.operation(),
+            operation: operation.clone(),
             additional_properties,
         };
 
         update_snapshot_summaries(
             summary,
             previous_snapshot.map(|s| s.summary()),
-            snapshot_produce_operation.operation() == Operation::Overwrite,
+            *operation == Operation::Overwrite,
         )
     }
 
@@ -591,10 +481,10 @@ impl<'a> SnapshotProducer<'a> {
     }
 
     /// Finished building the action and return the [`ActionCommit`] to the transaction.
-    pub(crate) async fn commit<OP: SnapshotProduceOperation, MP: ManifestProcess>(
+    async fn commit(
         mut self,
-        snapshot_produce_operation: OP,
-        process: MP,
+        operation: Operation,
+        existing_manifests: Vec<ManifestFile>,
     ) -> Result<ActionCommit> {
         let manifest_list_path = self.generate_manifest_list_file_path(0)?;
         let next_seq_num = self.table.metadata().next_sequence_number();
@@ -636,13 +526,11 @@ impl<'a> SnapshotProducer<'a> {
         // Calling self.summary() before self.produce_manifests() is important because self.added_data_files
         // will be set to an empty vec after self.produce_manifests() returns, resulting in an empty summary
         // being generated.
-        let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
+        let summary = self.summary(&operation).map_err(|err| {
             Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
         })?;
 
-        let new_manifests = self
-            .produce_manifests(&snapshot_produce_operation, &process)
-            .await?;
+        let new_manifests = self.produce_manifests(existing_manifests).await?;
 
         manifest_list_writer.add_manifests(new_manifests.into_iter())?;
         let writer_next_row_id = manifest_list_writer.next_row_id();
