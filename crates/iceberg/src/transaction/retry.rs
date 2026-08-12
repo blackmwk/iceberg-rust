@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
-use crate::spec::{ManifestContentType, ManifestFile, Operation, SnapshotRef};
+use crate::spec::{DataFile, Manifest, ManifestContentType, ManifestFile, Operation, SnapshotRef};
 use crate::table::Table;
 use crate::{Error, ErrorKind, Result};
 
@@ -75,9 +75,18 @@ pub(crate) struct SnapshotRetryState {
     attempt: u64,
     added_data_manifest: Option<ManifestFile>,
     added_delete_manifest: Option<ManifestFile>,
+    loaded_manifests: HashMap<String, Manifest>,
+    filtered_manifests: HashMap<String, FilteredManifest>,
+    rewrite_counter: u64,
     owned_artifacts: HashSet<String>,
     #[cfg(test)]
     manifest_list_loads: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct FilteredManifest {
+    pub(crate) output: ManifestFile,
+    pub(crate) removed_files: Vec<DataFile>,
 }
 
 impl SnapshotRetryState {
@@ -110,6 +119,7 @@ impl SnapshotRetryState {
         self.snapshot_id = Some(snapshot_id);
         self.added_data_manifest = None;
         self.added_delete_manifest = None;
+        self.filtered_manifests.clear();
         snapshot_id
     }
 
@@ -139,6 +149,32 @@ impl SnapshotRetryState {
 
     pub(crate) fn track_manifest_list(&mut self, path: String) {
         self.owned_artifacts.insert(path);
+    }
+
+    pub(crate) fn loaded_manifest(&self, path: &str) -> Option<Manifest> {
+        self.loaded_manifests.get(path).cloned()
+    }
+
+    pub(crate) fn cache_loaded_manifest(&mut self, path: String, manifest: Manifest) {
+        self.loaded_manifests.insert(path, manifest);
+    }
+
+    pub(crate) fn filtered_manifest(&self, path: &str) -> Option<FilteredManifest> {
+        self.filtered_manifests.get(path).cloned()
+    }
+
+    pub(crate) fn cache_filtered_manifest(&mut self, path: String, result: FilteredManifest) {
+        if result.output.manifest_path != path {
+            self.owned_artifacts
+                .insert(result.output.manifest_path.clone());
+        }
+        self.filtered_manifests.insert(path, result);
+    }
+
+    pub(crate) fn next_rewrite_id(&mut self) -> u64 {
+        let id = self.rewrite_counter;
+        self.rewrite_counter += 1;
+        id
     }
 
     pub(crate) async fn cleanup(&mut self, table: &Table, commit_error: Option<&Error>) {

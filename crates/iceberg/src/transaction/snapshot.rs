@@ -31,7 +31,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
-use crate::transaction::retry::SnapshotRetryState;
+use crate::transaction::retry::{FilteredManifest, SnapshotRetryState};
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 /// Immutable files to apply in a snapshot-producing action.
@@ -39,6 +39,9 @@ use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 pub(crate) struct SnapshotChanges {
     added_data_files: Vec<DataFile>,
     added_delete_files: Vec<DataFile>,
+    removed_data_paths: HashSet<String>,
+    removed_delete_paths: HashSet<String>,
+    fail_missing_files: bool,
 }
 
 impl SnapshotChanges {
@@ -46,12 +49,44 @@ impl SnapshotChanges {
         Self {
             added_data_files,
             added_delete_files: Vec::new(),
+            removed_data_paths: HashSet::new(),
+            removed_delete_paths: HashSet::new(),
+            fail_missing_files: true,
         }
     }
 
     #[allow(dead_code)] // Used by row-delta in a later stack layer.
     pub(crate) fn with_added_delete_files(mut self, files: Vec<DataFile>) -> Self {
         self.added_delete_files = files;
+        self
+    }
+
+    #[allow(dead_code)] // Used by delete/rewrite actions in later stack layers.
+    pub(crate) fn with_removed_data_files(mut self, files: &[DataFile]) -> Self {
+        self.removed_data_paths
+            .extend(files.iter().map(|file| file.file_path.clone()));
+        self
+    }
+
+    #[allow(dead_code)] // Used by delete/overwrite actions in later stack layers.
+    pub(crate) fn with_removed_data_paths(
+        mut self,
+        paths: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.removed_data_paths.extend(paths);
+        self
+    }
+
+    #[allow(dead_code)] // Used by rewrite/overwrite actions in later stack layers.
+    pub(crate) fn with_removed_delete_files(mut self, files: &[DataFile]) -> Self {
+        self.removed_delete_paths
+            .extend(files.iter().map(|file| file.file_path.clone()));
+        self
+    }
+
+    #[allow(dead_code)] // Used by path-based delete actions in later stack layers.
+    pub(crate) fn with_fail_missing_files(mut self, fail: bool) -> Self {
+        self.fail_missing_files = fail;
         self
     }
 }
@@ -111,19 +146,19 @@ impl<'a> SnapshotCommitBuilder<'a> {
         let commit_uuid = retry.commit_uuid(self.commit_uuid)?;
         let snapshot_id = retry.snapshot_id(self.table);
         let attempt = retry.next_attempt();
-        let writer = SnapshotWriter::new(
+        let mut writer = SnapshotWriter::new(
             self.table,
             snapshot_id,
             commit_uuid,
             self.snapshot_properties,
-            self.changes.added_data_files,
-            self.changes.added_delete_files,
+            self.changes,
         );
         writer.validate_added_data_files()?;
         writer.validate_added_delete_files()?;
         if self.check_duplicate {
             writer.validate_duplicate_files().await?;
         }
+        let existing_manifests = writer.filter_manifests(existing_manifests, retry).await?;
         let result = writer
             .commit(
                 self.operation,
@@ -150,6 +185,7 @@ mod change_set_tests {
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, SnapshotRef, Struct,
     };
+    use crate::transaction::Transaction;
     use crate::transaction::tests::make_v2_minimal_table;
 
     fn take_snapshot(mut commit: ActionCommit) -> SnapshotRef {
@@ -366,6 +402,82 @@ mod change_set_tests {
         };
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
     }
+
+    #[tokio::test]
+    async fn filters_removed_files_once_across_retries() {
+        let table = make_v2_minimal_table();
+        let file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/remove.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+        let append = SnapshotCommitBuilder::new(
+            &table,
+            Operation::Append,
+            None,
+            HashMap::new(),
+            SnapshotChanges::new(vec![file.clone()]),
+        )
+        .commit(&mut SnapshotRetryState::default())
+        .await
+        .unwrap();
+        let table = Transaction::apply(table, append, &mut Vec::new(), &mut Vec::new()).unwrap();
+        let mut retry = SnapshotRetryState::default();
+
+        let remove = || SnapshotChanges::new(Vec::new()).with_removed_data_files(&[file.clone()]);
+        let first = take_snapshot(
+            SnapshotCommitBuilder::new(&table, Operation::Delete, None, HashMap::new(), remove())
+                .commit(&mut retry)
+                .await
+                .unwrap(),
+        );
+        let second = take_snapshot(
+            SnapshotCommitBuilder::new(&table, Operation::Delete, None, HashMap::new(), remove())
+                .commit(&mut retry)
+                .await
+                .unwrap(),
+        );
+        let first_list = table.manifest_list_reader(&first).load().await.unwrap();
+        let second_list = table.manifest_list_reader(&second).load().await.unwrap();
+        assert_eq!(
+            first_list.entries()[0].manifest_path,
+            second_list.entries()[0].manifest_path
+        );
+        let rewritten = table
+            .manifest_reader()
+            .read(&first_list.entries()[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            rewritten.entries()[0].status(),
+            crate::spec::ManifestStatus::Deleted
+        );
+        assert_eq!(
+            first
+                .summary()
+                .additional_properties
+                .get("deleted-data-files")
+                .map(String::as_str),
+            Some("1")
+        );
+
+        let missing = SnapshotCommitBuilder::new(
+            &table,
+            Operation::Delete,
+            None,
+            HashMap::new(),
+            SnapshotChanges::new(Vec::new())
+                .with_removed_data_paths(["test/missing.parquet".to_string()]),
+        )
+        .commit(&mut SnapshotRetryState::default())
+        .await;
+        assert!(missing.is_err());
+    }
 }
 
 struct SnapshotWriter<'a> {
@@ -375,6 +487,11 @@ struct SnapshotWriter<'a> {
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
     added_delete_files: Vec<DataFile>,
+    removed_data_paths: HashSet<String>,
+    removed_delete_paths: HashSet<String>,
+    removed_data_files: Vec<DataFile>,
+    removed_delete_files: Vec<DataFile>,
+    fail_missing_files: bool,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -394,16 +511,20 @@ impl<'a> SnapshotWriter<'a> {
         snapshot_id: i64,
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
-        added_data_files: Vec<DataFile>,
-        added_delete_files: Vec<DataFile>,
+        changes: SnapshotChanges,
     ) -> Self {
         Self {
             table,
             snapshot_id,
             commit_uuid,
             snapshot_properties,
-            added_data_files,
-            added_delete_files,
+            added_data_files: changes.added_data_files,
+            added_delete_files: changes.added_delete_files,
+            removed_data_paths: changes.removed_data_paths,
+            removed_delete_paths: changes.removed_delete_paths,
+            removed_data_files: Vec::new(),
+            removed_delete_files: Vec::new(),
+            fail_missing_files: changes.fail_missing_files,
             manifest_counter: (0..),
         }
     }
@@ -543,6 +664,132 @@ impl<'a> SnapshotWriter<'a> {
         Ok(())
     }
 
+    async fn filter_manifests(
+        &mut self,
+        manifests: Vec<ManifestFile>,
+        retry: &mut SnapshotRetryState,
+    ) -> Result<Vec<ManifestFile>> {
+        let added_paths = self
+            .added_data_files
+            .iter()
+            .chain(&self.added_delete_files)
+            .map(|file| file.file_path.as_str())
+            .collect::<HashSet<_>>();
+        let removed_paths = self
+            .removed_data_paths
+            .iter()
+            .chain(&self.removed_delete_paths)
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let overlap = added_paths
+            .intersection(&removed_paths)
+            .copied()
+            .collect::<Vec<_>>();
+        if !overlap.is_empty() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot add and remove the same files: {}",
+                    overlap.join(", ")
+                ),
+            ));
+        }
+        if removed_paths.is_empty() {
+            return Ok(manifests);
+        }
+
+        let mut outputs = Vec::with_capacity(manifests.len());
+        let mut found_data = HashSet::new();
+        let mut found_deletes = HashSet::new();
+        for source in manifests {
+            let cached = retry.filtered_manifest(&source.manifest_path);
+            let result = if let Some(cached) = cached {
+                cached
+            } else {
+                let manifest = if let Some(manifest) = retry.loaded_manifest(&source.manifest_path)
+                {
+                    manifest
+                } else {
+                    let manifest = self.table.manifest_reader().read(&source).await?;
+                    retry.cache_loaded_manifest(source.manifest_path.clone(), manifest.clone());
+                    manifest
+                };
+                let requested = if source.content == ManifestContentType::Data {
+                    &self.removed_data_paths
+                } else {
+                    &self.removed_delete_paths
+                };
+                let removed_files = manifest
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.is_alive() && requested.contains(entry.file_path()))
+                    .map(|entry| entry.data_file().clone())
+                    .collect::<Vec<_>>();
+
+                let output = if removed_files.is_empty() {
+                    source.clone()
+                } else {
+                    let path = format!(
+                        "{}/{}-r{}.{}",
+                        self.table.metadata().metadata_location()?,
+                        self.commit_uuid,
+                        retry.next_rewrite_id(),
+                        DataFileFormat::Avro
+                    );
+                    let mut writer = self.new_manifest_writer_for_spec(
+                        source.content,
+                        source.partition_spec_id,
+                        path,
+                    )?;
+                    for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                        if requested.contains(entry.file_path()) {
+                            writer.add_delete_entry((**entry).clone())?;
+                        } else {
+                            writer.add_existing_entry((**entry).clone())?;
+                        }
+                    }
+                    writer.write_manifest_file().await?
+                };
+                let result = FilteredManifest {
+                    output,
+                    removed_files,
+                };
+                retry.cache_filtered_manifest(source.manifest_path.clone(), result.clone());
+                result
+            };
+
+            for file in &result.removed_files {
+                if source.content == ManifestContentType::Data {
+                    found_data.insert(file.file_path.clone());
+                    self.removed_data_files.push(file.clone());
+                } else {
+                    found_deletes.insert(file.file_path.clone());
+                    self.removed_delete_files.push(file.clone());
+                }
+            }
+            outputs.push(result.output);
+        }
+
+        if self.fail_missing_files {
+            let missing = self
+                .removed_data_paths
+                .difference(&found_data)
+                .chain(self.removed_delete_paths.difference(&found_deletes))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot remove files that are not live: {}",
+                        missing.join(", ")
+                    ),
+                ));
+            }
+        }
+        Ok(outputs)
+    }
+
     fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
         let new_manifest_path = format!(
             "{}/{}-m{}.{}",
@@ -551,13 +798,32 @@ impl<'a> SnapshotWriter<'a> {
             self.manifest_counter.next().unwrap(),
             DataFileFormat::Avro
         );
-        let output_file = self.table.file_io().new_output(new_manifest_path)?;
+        self.new_manifest_writer_for_spec(
+            content,
+            self.table.metadata().default_partition_spec_id(),
+            new_manifest_path,
+        )
+    }
+
+    fn new_manifest_writer_for_spec(
+        &self,
+        content: ManifestContentType,
+        spec_id: i32,
+        path: String,
+    ) -> Result<ManifestWriter> {
         let partition_spec = self
             .table
             .metadata()
-            .default_partition_spec()
+            .partition_spec_by_id(spec_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Cannot find partition spec {spec_id} for manifest rewrite"),
+                )
+            })?
             .as_ref()
             .clone();
+        let output_file = self.table.file_io().new_output(path)?;
         let schema = self.table.metadata().current_schema().clone();
 
         let builder = if let Some(em) = self.table.encryption_manager() {
@@ -680,6 +946,8 @@ impl<'a> SnapshotWriter<'a> {
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
         if self.added_data_files.is_empty()
             && self.added_delete_files.is_empty()
+            && self.removed_data_files.is_empty()
+            && self.removed_delete_files.is_empty()
             && self.snapshot_properties.is_empty()
         {
             return Err(Error::new(
@@ -742,6 +1010,29 @@ impl<'a> SnapshotWriter<'a> {
                 table_metadata.default_partition_spec().clone(),
             );
         }
+        for data_file in self
+            .removed_data_files
+            .iter()
+            .chain(&self.removed_delete_files)
+        {
+            let partition_spec = table_metadata
+                .partition_spec_by_id(data_file.partition_spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot find partition spec {} for removed file",
+                            data_file.partition_spec_id
+                        ),
+                    )
+                })?
+                .clone();
+            summary_collector.remove_file(
+                data_file,
+                table_metadata.current_schema().clone(),
+                partition_spec,
+            );
+        }
 
         let previous_snapshot = table_metadata.current_snapshot();
 
@@ -758,11 +1049,7 @@ impl<'a> SnapshotWriter<'a> {
             additional_properties,
         };
 
-        update_snapshot_summaries(
-            summary,
-            previous_snapshot.map(|s| s.summary()),
-            *operation == Operation::Overwrite,
-        )
+        update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()), false)
     }
 
     fn generate_manifest_list_file_path(&self, attempt: i64) -> Result<String> {
