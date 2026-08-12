@@ -16,8 +16,15 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use crate::spec::{DataContentType, DataFile, ManifestContentType};
+use crate::expr::visitors::expression_evaluator::ExpressionEvaluator;
+use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
+use crate::expr::visitors::inclusive_projection::InclusiveProjection;
+use crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator;
+use crate::expr::visitors::strict_projection::StrictProjection;
+use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::spec::{DataContentType, DataFile, ManifestContentType, Schema};
 use crate::table::Table;
 use crate::transaction::retry::SnapshotRetryState;
 use crate::{Error, ErrorKind, Result};
@@ -27,6 +34,76 @@ use crate::{Error, ErrorKind, Result};
 #[allow(dead_code)] // Consumed by validation actions in the next stack layers.
 pub(crate) struct SnapshotValidation {
     starting_snapshot_id: Option<i64>,
+}
+
+/// A bound row predicate used for conservative conflict detection and exact
+/// whole-file matching.
+pub(crate) struct ConflictFilter {
+    bound: BoundPredicate,
+    case_sensitive: bool,
+}
+
+#[allow(dead_code)] // Public snapshot actions consume this in later stack layers.
+impl ConflictFilter {
+    pub(crate) fn new(table: &Table, predicate: Predicate, case_sensitive: bool) -> Result<Self> {
+        Ok(Self {
+            bound: predicate.bind(table.metadata().current_schema().clone(), case_sensitive)?,
+            case_sensitive,
+        })
+    }
+
+    pub(crate) fn could_match(&self, table: &Table, file: &DataFile) -> Result<bool> {
+        Ok(self.partition_matches(table, file, false)?
+            && InclusiveMetricsEvaluator::eval(&self.bound, file, false)?)
+    }
+
+    pub(crate) fn must_match(&self, table: &Table, file: &DataFile) -> Result<bool> {
+        Ok(self.partition_matches(table, file, true)?
+            || StrictMetricsEvaluator::eval(&self.bound, file)?)
+    }
+
+    fn partition_matches(&self, table: &Table, file: &DataFile, strict: bool) -> Result<bool> {
+        let spec = table
+            .metadata()
+            .partition_spec_by_id(file.partition_spec_id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Cannot find partition spec {}", file.partition_spec_id),
+                )
+            })?
+            .clone();
+        if spec.fields().iter().any(|field| {
+            table
+                .metadata()
+                .current_schema()
+                .field_by_id(field.source_id)
+                .is_none()
+        }) {
+            return Ok(!strict);
+        }
+        let partition_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(spec.spec_id())
+                .with_fields(
+                    spec.partition_type(table.metadata().current_schema())?
+                        .fields()
+                        .to_owned(),
+                )
+                .build()?,
+        );
+        let projected = if strict {
+            StrictProjection::new(spec)
+                .strict_project(&self.bound)?
+                .rewrite_not()
+        } else {
+            InclusiveProjection::new(spec)
+                .project(&self.bound)?
+                .rewrite_not()
+        }
+        .bind(partition_schema, self.case_sensitive)?;
+        ExpressionEvaluator::new(projected).eval(file)
+    }
 }
 
 impl SnapshotValidation {
@@ -172,6 +249,70 @@ impl SnapshotValidation {
         }
         Ok(())
     }
+
+    /// Detect predicate-scoped data additions, delete additions, and removals
+    /// in snapshots committed after the validation boundary.
+    #[allow(dead_code)] // Used by delete/overwrite/row-delta actions in later layers.
+    pub(crate) async fn validate_no_conflicting_files(
+        &self,
+        table: &Table,
+        retry: &mut SnapshotRetryState,
+        filter: &ConflictFilter,
+        check_data_additions: bool,
+        check_delete_additions: bool,
+        check_removals: bool,
+    ) -> Result<()> {
+        let history = self.history(table, retry).await?;
+        for snapshot_id in history {
+            let manifests = retry
+                .processed(snapshot_id)
+                .into_iter()
+                .flat_map(|snapshot| {
+                    snapshot
+                        .introduced_data_manifests()
+                        .iter()
+                        .chain(snapshot.introduced_delete_manifests())
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            for manifest_file in manifests {
+                let manifest = retry.load_manifest(table, &manifest_file).await?;
+                for entry in manifest.entries() {
+                    let is_removal = entry.status() == crate::spec::ManifestStatus::Deleted;
+                    let is_addition = entry.status() == crate::spec::ManifestStatus::Added;
+                    let should_check = (is_removal && check_removals)
+                        || (is_addition
+                            && match entry.content_type() {
+                                DataContentType::Data => check_data_additions,
+                                DataContentType::PositionDeletes
+                                | DataContentType::EqualityDeletes => check_delete_additions,
+                            });
+                    if !should_check {
+                        continue;
+                    }
+                    let path = entry.file_path();
+                    let (could_match, must_match) =
+                        if let Some(result) = retry.predicate_result(path) {
+                            result
+                        } else {
+                            let result = (
+                                filter.could_match(table, entry.data_file())?,
+                                filter.must_match(table, entry.data_file())?,
+                            );
+                            retry.cache_predicate_result(path.to_string(), result);
+                            result
+                        };
+                    if could_match || (is_removal && must_match) {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Conflicting file {} matches the validation filter", path),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -246,7 +387,9 @@ fn delete_applies(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{DataFileBuilder, DataFileFormat, Struct};
+    use crate::expr::Reference;
+    use crate::spec::{DataFileBuilder, DataFileFormat, Datum, Literal, Struct};
+    use crate::transaction::tests::make_v2_minimal_table;
 
     fn file(content: DataContentType, path: &str) -> DataFile {
         DataFileBuilder::default()
@@ -271,5 +414,32 @@ mod tests {
         assert!(delete_applies(&data, 5, &equality, 6));
         assert!(delete_applies(&data, 5, &position, 5));
         assert!(!delete_applies(&data, 5, &position, 4));
+    }
+
+    #[test]
+    fn conflict_filter_binds_case_sensitivity_and_projects_partitions() {
+        let table = make_v2_minimal_table();
+        assert!(
+            ConflictFilter::new(&table, Reference::new("X").equal_to(Datum::long(300)), true,)
+                .is_err()
+        );
+        let filter = ConflictFilter::new(
+            &table,
+            Reference::new("X").equal_to(Datum::long(300)),
+            false,
+        )
+        .unwrap();
+        let partitioned = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("data.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(1)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+        assert!(filter.could_match(&table, &partitioned).unwrap());
+        assert!(filter.must_match(&table, &partitioned).unwrap());
     }
 }

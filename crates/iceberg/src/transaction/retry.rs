@@ -87,6 +87,7 @@ pub(crate) struct SnapshotRetryState {
     added_delete_manifest: Option<ManifestFile>,
     loaded_manifests: HashMap<String, Manifest>,
     filtered_manifests: HashMap<String, FilteredManifest>,
+    predicate_results: HashMap<String, (bool, bool)>,
     rewrite_counter: u64,
     owned_artifacts: HashSet<String>,
     #[cfg(test)]
@@ -198,6 +199,14 @@ impl SnapshotRetryState {
         let id = self.rewrite_counter;
         self.rewrite_counter += 1;
         id
+    }
+
+    pub(crate) fn predicate_result(&self, path: &str) -> Option<(bool, bool)> {
+        self.predicate_results.get(path).copied()
+    }
+
+    pub(crate) fn cache_predicate_result(&mut self, path: String, result: (bool, bool)) {
+        self.predicate_results.insert(path, result);
     }
 
     pub(crate) async fn cleanup(&mut self, table: &Table, commit_error: Option<&Error>) {
