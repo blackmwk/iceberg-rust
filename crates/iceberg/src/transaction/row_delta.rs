@@ -15,15 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use crate::expr::Predicate;
 use crate::spec::{DataFile, Operation};
 use crate::table::Table;
 use crate::transaction::retry::SnapshotRetryState;
 use crate::transaction::snapshot::{SnapshotChanges, SnapshotCommitBuilder};
+use crate::transaction::validate::{ConflictFilter, SnapshotValidation};
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, Result};
 
@@ -34,8 +36,14 @@ pub struct RowDeltaAction {
     check_duplicate: bool,
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
-    #[allow(dead_code)] // Used by RowDelta validation in the next stack layer.
     pub(crate) starting_snapshot_id: Option<i64>,
+    referenced_data_files: Vec<DataFile>,
+    validate_data_files_exist: bool,
+    validate_deleted_files: bool,
+    validate_conflicting_data: bool,
+    validate_conflicting_deletes: bool,
+    conflict_filter: Option<Predicate>,
+    case_sensitive: bool,
 }
 
 impl RowDeltaAction {
@@ -47,6 +55,13 @@ impl RowDeltaAction {
             commit_uuid: None,
             snapshot_properties: HashMap::new(),
             starting_snapshot_id,
+            referenced_data_files: Vec::new(),
+            validate_data_files_exist: false,
+            validate_deleted_files: false,
+            validate_conflicting_data: false,
+            validate_conflicting_deletes: false,
+            conflict_filter: None,
+            case_sensitive: true,
         }
     }
 
@@ -80,6 +95,49 @@ impl RowDeltaAction {
         self
     }
 
+    /// Set the snapshot boundary used for conflict validation.
+    pub fn validate_from_snapshot(mut self, snapshot_id: i64) -> Self {
+        self.starting_snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Require referenced data files to remain live.
+    pub fn validate_data_files_exist(mut self, files: impl IntoIterator<Item = DataFile>) -> Self {
+        self.referenced_data_files.extend(files);
+        self.validate_data_files_exist = true;
+        self
+    }
+
+    /// Reject referenced files deleted or rewritten since the validation boundary.
+    pub fn validate_deleted_files(mut self) -> Self {
+        self.validate_deleted_files = true;
+        self
+    }
+
+    /// Set the predicate used to scope concurrent-write checks.
+    pub fn conflict_detection_filter(mut self, predicate: Predicate) -> Self {
+        self.conflict_filter = Some(predicate);
+        self
+    }
+
+    /// Configure case-sensitive conflict-filter binding.
+    pub fn case_sensitive(mut self, case_sensitive: bool) -> Self {
+        self.case_sensitive = case_sensitive;
+        self
+    }
+
+    /// Reject concurrently added data files matching the conflict filter.
+    pub fn validate_no_conflicting_data_files(mut self) -> Self {
+        self.validate_conflicting_data = true;
+        self
+    }
+
+    /// Reject concurrently added delete files that may affect the delta.
+    pub fn validate_no_conflicting_delete_files(mut self) -> Self {
+        self.validate_conflicting_deletes = true;
+        self
+    }
+
     fn operation(&self) -> Operation {
         match (
             self.added_data_files.is_empty(),
@@ -96,6 +154,46 @@ impl RowDeltaAction {
         table: &Table,
         retry: &mut SnapshotRetryState,
     ) -> Result<ActionCommit> {
+        let validation = SnapshotValidation::from_snapshot(self.starting_snapshot_id);
+        let referenced_paths = self
+            .referenced_data_files
+            .iter()
+            .map(|file| file.file_path.clone())
+            .collect::<HashSet<_>>();
+        if self.validate_data_files_exist {
+            validation
+                .validate_files_exist(table, retry, &referenced_paths, &HashSet::new())
+                .await?;
+        }
+        if self.validate_deleted_files {
+            validation
+                .validate_no_rewrites(table, retry, &referenced_paths)
+                .await?;
+        }
+        if self.validate_conflicting_deletes {
+            validation
+                .validate_no_new_deletes(table, retry, &self.referenced_data_files, false)
+                .await?;
+        }
+        if self.validate_conflicting_data || self.validate_conflicting_deletes {
+            let filter = ConflictFilter::new(
+                table,
+                self.conflict_filter
+                    .clone()
+                    .unwrap_or(Predicate::AlwaysTrue),
+                self.case_sensitive,
+            )?;
+            validation
+                .validate_no_conflicting_files(
+                    table,
+                    retry,
+                    &filter,
+                    self.validate_conflicting_data,
+                    self.validate_conflicting_deletes,
+                    self.validate_deleted_files,
+                )
+                .await?;
+        }
         let changes = SnapshotChanges::new(self.added_data_files.clone())
             .with_added_delete_files(self.added_delete_files.clone());
         SnapshotCommitBuilder::new(
@@ -215,6 +313,21 @@ mod tests {
             "delete.parquet",
         )]);
         assert_eq!(delete_only.operation(), Operation::Delete);
+    }
+
+    #[tokio::test]
+    async fn row_delta_rejects_non_ancestor_validation_start() {
+        let table = make_v2_minimal_table();
+        let result = Arc::new(
+            Transaction::new(&table)
+                .row_delta()
+                .validate_from_snapshot(i64::MAX)
+                .validate_no_conflicting_data_files()
+                .add_data_files([file(&table, DataContentType::Data, "data.parquet")]),
+        )
+        .commit(&mut SnapshotRetryState::default(), &table)
+        .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
