@@ -55,6 +55,8 @@ mod action;
 pub use action::*;
 mod append;
 mod expire_snapshots;
+#[allow(dead_code)] // Used by snapshot actions in later stack layers.
+mod retry;
 mod snapshot;
 mod sort_order;
 mod update_location;
