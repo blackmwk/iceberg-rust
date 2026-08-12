@@ -62,6 +62,30 @@ impl ConflictFilter {
             || StrictMetricsEvaluator::eval(&self.bound, file)?)
     }
 
+    pub(crate) async fn matching_live_data_files(
+        &self,
+        table: &Table,
+        retry: &mut SnapshotRetryState,
+    ) -> Result<Vec<DataFile>> {
+        let live = live_files(table, retry).await?;
+        let mut matches = Vec::new();
+        for live_file in live.data.values() {
+            if self.could_match(table, &live_file.file)? {
+                if !self.must_match(table, &live_file.file)? {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot delete file {} because only some rows may match",
+                            live_file.file.file_path
+                        ),
+                    ));
+                }
+                matches.push(live_file.file.clone());
+            }
+        }
+        Ok(matches)
+    }
+
     fn partition_matches(&self, table: &Table, file: &DataFile, strict: bool) -> Result<bool> {
         let spec = table
             .metadata()
@@ -322,6 +346,7 @@ struct LiveFiles {
 }
 
 struct LiveFile {
+    file: DataFile,
     sequence_number: Option<i64>,
 }
 
@@ -353,6 +378,7 @@ async fn live_files(table: &Table, retry: &mut SnapshotRetryState) -> Result<Liv
             .filter(|entry| entry.is_alive())
         {
             destination.insert(entry.file_path().to_string(), LiveFile {
+                file: entry.data_file().clone(),
                 sequence_number: entry.sequence_number(),
             });
         }

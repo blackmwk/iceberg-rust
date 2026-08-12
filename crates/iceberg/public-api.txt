@@ -3232,6 +3232,15 @@ pub fn iceberg::transaction::AddColumn::optional(name: impl alloc::string::ToStr
 pub fn iceberg::transaction::AddColumn::required(name: impl alloc::string::ToString, field_type: iceberg::spec::Type, initial_default: iceberg::spec::Literal) -> Self
 impl iceberg::transaction::AddColumn
 pub fn iceberg::transaction::AddColumn::builder() -> AddColumnBuilder<((), (), (), (), (), (), ())>
+pub struct iceberg::transaction::DeleteFilesAction
+impl iceberg::transaction::DeleteFilesAction
+pub fn iceberg::transaction::DeleteFilesAction::case_sensitive(self, case_sensitive: bool) -> Self
+pub fn iceberg::transaction::DeleteFilesAction::delete_data_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
+pub fn iceberg::transaction::DeleteFilesAction::delete_file_paths(self, paths: impl core::iter::traits::collect::IntoIterator<Item = alloc::string::String>) -> Self
+pub fn iceberg::transaction::DeleteFilesAction::delete_from_row_filter(self, predicate: iceberg::expr::Predicate) -> Self
+pub fn iceberg::transaction::DeleteFilesAction::fail_missing_files(self, fail: bool) -> Self
+pub fn iceberg::transaction::DeleteFilesAction::set_commit_uuid(self, commit_uuid: uuid::Uuid) -> Self
+pub fn iceberg::transaction::DeleteFilesAction::set_snapshot_properties(self, properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
 pub struct iceberg::transaction::ExpireSnapshotsAction
 impl iceberg::transaction::ExpireSnapshotsAction
 pub fn iceberg::transaction::ExpireSnapshotsAction::expire_older_than_ms(self, older_than_ms: i64) -> Self
@@ -3250,6 +3259,7 @@ pub fn iceberg::transaction::ReplaceSortOrderAction::desc(self, name: &str, null
 pub struct iceberg::transaction::Transaction
 impl iceberg::transaction::Transaction
 pub async fn iceberg::transaction::Transaction::commit(self, catalog: &dyn iceberg::Catalog) -> iceberg::Result<iceberg::table::Table>
+pub fn iceberg::transaction::Transaction::delete_files(&self) -> iceberg::transaction::DeleteFilesAction
 pub fn iceberg::transaction::Transaction::expire_snapshots(&self) -> iceberg::transaction::ExpireSnapshotsAction
 pub fn iceberg::transaction::Transaction::fast_append(&self) -> iceberg::transaction::FastAppendAction
 pub fn iceberg::transaction::Transaction::new(table: &iceberg::table::Table) -> Self

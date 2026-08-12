@@ -54,6 +54,7 @@ mod action;
 
 pub use action::*;
 mod append;
+mod delete_files;
 mod expire_snapshots;
 #[allow(dead_code)] // Used by snapshot actions in later stack layers.
 mod retry;
@@ -77,6 +78,7 @@ use crate::spec::TableProperties;
 use crate::table::Table;
 use crate::transaction::action::TransactionActionEntry;
 pub use crate::transaction::append::FastAppendAction;
+pub use crate::transaction::delete_files::DeleteFilesAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
@@ -164,6 +166,11 @@ impl Transaction {
     /// Creates a fast append action.
     pub fn fast_append(&self) -> FastAppendAction {
         FastAppendAction::new()
+    }
+
+    /// Create an action that removes data files from the table.
+    pub fn delete_files(&self) -> DeleteFilesAction {
+        DeleteFilesAction::new(self.table.metadata().current_snapshot_id())
     }
 
     /// Creates replace sort order action.
