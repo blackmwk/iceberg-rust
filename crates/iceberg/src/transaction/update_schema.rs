@@ -333,7 +333,9 @@ fn rebuild_field(
 
 #[async_trait]
 impl TransactionAction for UpdateSchemaAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+    type State = ();
+
+    async fn commit(&self, _state: &mut Self::State, table: &Table) -> Result<ActionCommit> {
         let base_schema = table.metadata().current_schema();
         let mut last_column_id = table.metadata().last_column_id();
 
@@ -618,7 +620,7 @@ mod tests {
             Type::Primitive(PrimitiveType::Int),
         ));
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
         let updates = action_commit.take_updates();
         let requirements = action_commit.take_requirements();
 
@@ -666,7 +668,7 @@ mod tests {
                 .build(),
         );
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -693,7 +695,7 @@ mod tests {
             Literal::int(0),
         ));
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -721,7 +723,7 @@ mod tests {
             Type::Primitive(PrimitiveType::Int),
         ));
 
-        let result = Arc::new(action).commit(&table).await;
+        let result = Arc::new(action).commit(&mut (), &table).await;
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("should reject adding a column with an existing name"),
@@ -742,7 +744,7 @@ mod tests {
         // z is not an identifier field, so we can delete it.
         let action = tx.update_schema().delete_column("z");
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -765,7 +767,7 @@ mod tests {
 
         let action = tx.update_schema().delete_column("nonexistent");
 
-        let result = Arc::new(action).commit(&table).await;
+        let result = Arc::new(action).commit(&mut (), &table).await;
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("should reject deleting a non-existent column"),
@@ -792,7 +794,7 @@ mod tests {
                 Type::Primitive(PrimitiveType::Boolean),
             ));
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -823,7 +825,7 @@ mod tests {
                 Type::Primitive(PrimitiveType::Boolean),
             ));
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -876,7 +878,7 @@ mod tests {
                 .build(),
         );
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -911,7 +913,7 @@ mod tests {
                 .build(),
         );
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -941,7 +943,7 @@ mod tests {
                 .build(),
         );
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -976,7 +978,7 @@ mod tests {
                 .build(),
         );
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -1006,7 +1008,7 @@ mod tests {
                 .build(),
         );
 
-        let err = match Arc::new(action).commit(&table).await {
+        let err = match Arc::new(action).commit(&mut (), &table).await {
             Err(e) => e,
             Ok(_) => panic!("should reject adding to a nonexistent parent"),
         };
@@ -1032,7 +1034,7 @@ mod tests {
                 .build(),
         );
 
-        let err = match Arc::new(action).commit(&table).await {
+        let err = match Arc::new(action).commit(&mut (), &table).await {
             Err(e) => e,
             Ok(_) => panic!("should reject adding to a primitive parent"),
         };
@@ -1058,7 +1060,7 @@ mod tests {
                 .build(),
         );
 
-        let err = match Arc::new(action).commit(&table).await {
+        let err = match Arc::new(action).commit(&mut (), &table).await {
             Err(e) => e,
             Ok(_) => panic!("should reject adding a column with conflicting name"),
         };
@@ -1090,7 +1092,7 @@ mod tests {
                     .build(),
             );
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -1136,7 +1138,7 @@ mod tests {
             ])),
         ));
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {

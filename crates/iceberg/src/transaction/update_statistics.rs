@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -70,7 +69,9 @@ impl UpdateStatisticsAction {
 
 #[async_trait]
 impl TransactionAction for UpdateStatisticsAction {
-    async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
+    type State = ();
+
+    async fn commit(&self, _state: &mut Self::State, _table: &Table) -> Result<ActionCommit> {
         let mut updates: Vec<TableUpdate> = vec![];
 
         self.statistics_to_set
