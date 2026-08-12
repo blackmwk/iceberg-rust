@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::Result;
+use std::collections::{HashMap, HashSet};
+
+use crate::spec::{DataContentType, DataFile, ManifestContentType};
 use crate::table::Table;
 use crate::transaction::retry::SnapshotRetryState;
+use crate::{Error, ErrorKind, Result};
 
 /// Retry-aware history boundary shared by snapshot conflict validations.
 #[derive(Clone, Copy, Debug, Default)]
@@ -43,5 +46,230 @@ impl SnapshotValidation {
         retry
             .validation_history(table, self.starting_snapshot_id)
             .await
+    }
+
+    /// Validate that required paths are still live in the current snapshot.
+    #[allow(dead_code)] // Used by snapshot actions in later stack layers.
+    pub(crate) async fn validate_files_exist(
+        &self,
+        table: &Table,
+        retry: &mut SnapshotRetryState,
+        data_paths: &HashSet<String>,
+        delete_paths: &HashSet<String>,
+    ) -> Result<()> {
+        let live = live_files(table, retry).await?;
+        let missing = data_paths
+            .iter()
+            .filter(|path| !live.data.contains_key(*path))
+            .chain(
+                delete_paths
+                    .iter()
+                    .filter(|path| !live.deletes.contains_key(*path)),
+            )
+            .cloned()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Required files are no longer live: {}", missing.join(", ")),
+            ))
+        }
+    }
+
+    /// Reject data or delete files removed/replaced since the validation boundary.
+    #[allow(dead_code)] // Used by snapshot actions in later stack layers.
+    pub(crate) async fn validate_no_rewrites(
+        &self,
+        table: &Table,
+        retry: &mut SnapshotRetryState,
+        paths: &HashSet<String>,
+    ) -> Result<()> {
+        let history = self.history(table, retry).await?;
+        for snapshot_id in history {
+            let manifests = retry
+                .processed(snapshot_id)
+                .into_iter()
+                .flat_map(|snapshot| {
+                    snapshot
+                        .introduced_data_manifests()
+                        .iter()
+                        .chain(snapshot.introduced_delete_manifests())
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            for manifest in manifests {
+                if retry
+                    .load_manifest(table, &manifest)
+                    .await?
+                    .entries()
+                    .iter()
+                    .any(|entry| {
+                        entry.status() == crate::spec::ManifestStatus::Deleted
+                            && paths.contains(entry.file_path())
+                    })
+                {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "A required file was concurrently removed or rewritten",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject delete files introduced since the boundary that apply to the
+    /// referenced data files, using Iceberg's data-sequence rules.
+    #[allow(dead_code)] // Used by rewrite and row-delta actions in later layers.
+    pub(crate) async fn validate_no_new_deletes(
+        &self,
+        table: &Table,
+        retry: &mut SnapshotRetryState,
+        data_files: &[DataFile],
+        ignore_equality_deletes: bool,
+    ) -> Result<()> {
+        let live = live_files(table, retry).await?;
+        let history = self.history(table, retry).await?;
+        for snapshot_id in history {
+            let manifests = retry
+                .processed(snapshot_id)
+                .map(|snapshot| snapshot.introduced_delete_manifests().to_vec())
+                .unwrap_or_default();
+            for manifest_file in manifests {
+                let manifest = retry.load_manifest(table, &manifest_file).await?;
+                for delete in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                    if ignore_equality_deletes
+                        && delete.content_type() == DataContentType::EqualityDeletes
+                    {
+                        continue;
+                    }
+                    for data_file in data_files {
+                        let data_sequence = live
+                            .data
+                            .get(data_file.file_path())
+                            .and_then(|file| file.sequence_number)
+                            .unwrap_or(0);
+                        if delete_applies(
+                            data_file,
+                            data_sequence,
+                            delete.data_file(),
+                            delete.sequence_number().unwrap_or(0),
+                        ) {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                format!(
+                                    "New delete file {} applies to data file {}",
+                                    delete.file_path(),
+                                    data_file.file_path()
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct LiveFiles {
+    data: HashMap<String, LiveFile>,
+    deletes: HashMap<String, LiveFile>,
+}
+
+struct LiveFile {
+    sequence_number: Option<i64>,
+}
+
+async fn live_files(table: &Table, retry: &mut SnapshotRetryState) -> Result<LiveFiles> {
+    let manifests = retry
+        .process_current_snapshot(table)
+        .await?
+        .map(|snapshot| {
+            snapshot
+                .data_manifests()
+                .iter()
+                .chain(snapshot.delete_manifests())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut live = LiveFiles::default();
+    for manifest_file in manifests {
+        let destination = if manifest_file.content == ManifestContentType::Data {
+            &mut live.data
+        } else {
+            &mut live.deletes
+        };
+        for entry in retry
+            .load_manifest(table, &manifest_file)
+            .await?
+            .entries()
+            .iter()
+            .filter(|entry| entry.is_alive())
+        {
+            destination.insert(entry.file_path().to_string(), LiveFile {
+                sequence_number: entry.sequence_number(),
+            });
+        }
+    }
+    Ok(live)
+}
+
+fn delete_applies(
+    data: &DataFile,
+    data_sequence: i64,
+    delete: &DataFile,
+    delete_sequence: i64,
+) -> bool {
+    if let Some(referenced) = delete.referenced_data_file()
+        && referenced != data.file_path
+    {
+        return false;
+    }
+    let same_partition = delete.partition().fields().is_empty()
+        || (delete.partition_spec_id == data.partition_spec_id
+            && delete.partition() == data.partition());
+    if !same_partition {
+        return false;
+    }
+    match delete.content_type() {
+        DataContentType::EqualityDeletes => delete_sequence > data_sequence,
+        DataContentType::PositionDeletes => delete_sequence >= data_sequence,
+        DataContentType::Data => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{DataFileBuilder, DataFileFormat, Struct};
+
+    fn file(content: DataContentType, path: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(content)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(1)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::empty())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn delete_sequence_rules_are_content_specific() {
+        let data = file(DataContentType::Data, "data.parquet");
+        let equality = file(DataContentType::EqualityDeletes, "eq.parquet");
+        let position = file(DataContentType::PositionDeletes, "pos.parquet");
+
+        assert!(!delete_applies(&data, 5, &equality, 5));
+        assert!(delete_applies(&data, 5, &equality, 6));
+        assert!(delete_applies(&data, 5, &position, 5));
+        assert!(!delete_applies(&data, 5, &position, 4));
     }
 }

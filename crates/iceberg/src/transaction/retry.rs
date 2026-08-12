@@ -169,6 +169,19 @@ impl SnapshotRetryState {
         self.loaded_manifests.insert(path, manifest);
     }
 
+    pub(crate) async fn load_manifest(
+        &mut self,
+        table: &Table,
+        manifest: &ManifestFile,
+    ) -> Result<Manifest> {
+        if let Some(cached) = self.loaded_manifest(&manifest.manifest_path) {
+            return Ok(cached);
+        }
+        let loaded = table.manifest_reader().read(manifest).await?;
+        self.cache_loaded_manifest(manifest.manifest_path.clone(), loaded.clone());
+        Ok(loaded)
+    }
+
     pub(crate) fn filtered_manifest(&self, path: &str) -> Option<FilteredManifest> {
         self.filtered_manifests.get(path).cloned()
     }

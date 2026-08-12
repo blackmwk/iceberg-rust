@@ -706,14 +706,7 @@ impl<'a> SnapshotWriter<'a> {
             let result = if let Some(cached) = cached {
                 cached
             } else {
-                let manifest = if let Some(manifest) = retry.loaded_manifest(&source.manifest_path)
-                {
-                    manifest
-                } else {
-                    let manifest = self.table.manifest_reader().read(&source).await?;
-                    retry.cache_loaded_manifest(source.manifest_path.clone(), manifest.clone());
-                    manifest
-                };
+                let manifest = retry.load_manifest(self.table, &source).await?;
                 let requested = if source.content == ManifestContentType::Data {
                     &self.removed_data_paths
                 } else {
