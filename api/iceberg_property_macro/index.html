@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Iceberg property derive macro"><title>iceberg_property_macro - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-b7b9f40b.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="iceberg_property_macro" data-themes="" data-resource-suffix="" data-rustdoc-version="1.96.0-nightly (b90dc1e59 2026-03-04)" data-channel="nightly" data-search-js="search-63369b7b.js" data-stringdex-js="stringdex-b897f86f.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate iceberg_property_macro</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../iceberg_property_macro/index.html">iceberg_<wbr>property_<wbr>macro</a><span class="version">0.10.0</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#iceberg-property-derive-macro" title="Iceberg property derive macro">Iceberg property derive macro</a><ul><li><a href="#generated-api" title="Generated API">Generated API</a></li><li><a href="#complete-example" title="Complete example">Complete example</a></li><li><a href="#using-ordinary-derives-together" title="Using ordinary derives together">Using ordinary derives together</a></li></ul></li></ul><h3><a href="#derives">Crate Items</a></h3><ul class="block"><li><a href="#derives" title="Derive Macros">Derive Macros</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>iceberg_<wbr>property_<wbr>macro</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/iceberg_property_macro/lib.rs.html#18-34">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><!--
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Iceberg property derive macro"><title>iceberg_property_macro - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="iceberg_property_macro" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.0-nightly (e8e4541ff 2026-04-15)" data-channel="nightly" data-search-js="search-b5634cc7.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate iceberg_property_macro</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../iceberg_property_macro/index.html">iceberg_<wbr>property_<wbr>macro</a><span class="version">0.10.0</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#iceberg-property-derive-macro" title="Iceberg property derive macro">Iceberg property derive macro</a><ul><li><a href="#generated-api" title="Generated API">Generated API</a></li><li><a href="#complete-example" title="Complete example">Complete example</a></li><li><a href="#using-ordinary-derives-together" title="Using ordinary derives together">Using ordinary derives together</a></li></ul></li></ul><h3><a href="#derives">Crate Items</a></h3><ul class="block"><li><a href="#derives" title="Derive Macros">Derive Macros</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>iceberg_<wbr>property_<wbr>macro</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/iceberg_property_macro/lib.rs.html#18-34">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><!--
   Licensed to the Apache Software Foundation (ASF) under one
   or more contributor license agreements.  See the NOTICE file
   distributed with this work for additional information
@@ -40,6 +40,9 @@ resolve trait implementations, a user-defined <code>Copy</code> type returns <co
 Documentation attributes on the field are copied to the generated getter. The
 macro generates no setters, backing fields, or conversion back to a property
 map.</p>
+<p><code>Option&lt;T&gt;</code> key fields and <code>HashMap&lt;String, T&gt;</code> prefix fields must use the
+corresponding types from <code>std</code>. The macro recognizes those field shapes
+syntactically and generates code using the standard-library variants.</p>
 <h3 id="complete-example"><a class="doc-anchor" href="#complete-example">§</a>Complete example</h3>
 <p>This example covers exact keys and defaults, optional values, case-insensitive
 booleans, prefixed maps, nested groups, custom single-value parsing, custom
@@ -129,14 +132,16 @@ keys, and contextual errors.</p>
     </span><span class="attr">#[property(prefix = COLUMN_FPP_PREFIX, getter)]
     </span>column_fpp: HashMap&lt;String, f64&gt;,
 
-    <span class="doccomment">/// A single-key parser can validate and normalize a property value.
+    <span class="doccomment">/// An explicitly configured data path override.
+    /// `None` means callers should use `&lt;table-location&gt;/data`.
+    /// A single-key parser validates and normalizes configured values.
     </span><span class="attr">#[property(
         key = LOCATION,
-        default = <span class="string">"warehouse"</span>,
+        default = <span class="prelude-val">None</span>,
         parse_with = parse_location,
         getter
     )]
-    </span>location: String,
+    </span>location: <span class="prelude-ty">Option</span>&lt;String&gt;,
 
     <span class="doccomment">/// A full-map parser can model one field with multiple property keys.
     </span><span class="attr">#[property(
@@ -155,7 +160,7 @@ keys, and contextual errors.</p>
     <span class="macro">assert_eq!</span>(defaults.owner(), <span class="kw-2">&amp;</span><span class="prelude-val">None</span>);
     <span class="macro">assert!</span>(defaults.fanout_enabled());
     <span class="macro">assert!</span>(defaults.column_fpp().is_empty());
-    <span class="macro">assert_eq!</span>(defaults.location(), <span class="string">"warehouse"</span>);
+    <span class="macro">assert_eq!</span>(defaults.location(), <span class="kw-2">&amp;</span><span class="prelude-val">None</span>);
     <span class="macro">assert_eq!</span>(defaults.dimensions(), (<span class="number">640</span>, <span class="number">480</span>, <span class="number">320</span>));
 
     <span class="kw">let </span>raw = HashMap::from([
@@ -175,7 +180,10 @@ keys, and contextual errors.</p>
     <span class="macro">assert_eq!</span>(properties.owner().as_deref(), <span class="prelude-val">Some</span>(<span class="string">"iceberg"</span>));
     <span class="macro">assert!</span>(!properties.fanout_enabled());
     <span class="macro">assert_eq!</span>(properties.column_fpp()[<span class="string">"id"</span>], <span class="number">0.01</span>);
-    <span class="macro">assert_eq!</span>(properties.location(), <span class="string">"s3://bucket/table"</span>);
+    <span class="macro">assert_eq!</span>(
+        properties.location().as_deref(),
+        <span class="prelude-val">Some</span>(<span class="string">"s3://bucket/table"</span>)
+    );
     <span class="macro">assert_eq!</span>(properties.dimensions(), (<span class="number">1920</span>, <span class="number">1080</span>, <span class="number">720</span>));
 
     <span class="kw">let </span>error = TableLikeProperties::from_properties(<span class="kw-2">&amp;</span>HashMap::from([(
