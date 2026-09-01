@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 
 use crate::TableUpdate::UpgradeFormatVersion;
@@ -59,7 +57,9 @@ impl UpgradeFormatVersionAction {
 
 #[async_trait]
 impl TransactionAction for UpgradeFormatVersionAction {
-    async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
+    type State = ();
+
+    async fn commit(&self, _state: &mut Self::State, _table: &Table) -> Result<ActionCommit> {
         let format_version = self.format_version.ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,

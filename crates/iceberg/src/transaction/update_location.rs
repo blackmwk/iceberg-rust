@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 
 use crate::table::Table;
@@ -55,7 +53,9 @@ impl UpdateLocationAction {
 
 #[async_trait]
 impl TransactionAction for UpdateLocationAction {
-    async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
+    type State = ();
+
+    async fn commit(&self, _state: &mut Self::State, _table: &Table) -> Result<ActionCommit> {
         let updates: Vec<TableUpdate>;
         if let Some(location) = self.location.clone() {
             updates = vec![TableUpdate::SetLocation { location }];

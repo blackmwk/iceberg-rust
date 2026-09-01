@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -76,7 +75,9 @@ impl UpdatePropertiesAction {
 
 #[async_trait]
 impl TransactionAction for UpdatePropertiesAction {
-    async fn commit(self: Arc<Self>, _table: &Table) -> Result<ActionCommit> {
+    type State = ();
+
+    async fn commit(&self, _state: &mut Self::State, _table: &Table) -> Result<ActionCommit> {
         if let Some(overlapping_key) = self.removals.iter().find(|k| self.updates.contains_key(*k))
         {
             return Err(Error::new(

@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 
 use crate::error::Result;
@@ -93,7 +91,9 @@ impl ReplaceSortOrderAction {
 
 #[async_trait]
 impl TransactionAction for ReplaceSortOrderAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+    type State = ();
+
+    async fn commit(&self, _state: &mut Self::State, table: &Table) -> Result<ActionCommit> {
         let current_schema = table.metadata().current_schema();
         let sort_fields: Result<Vec<SortField>> = self
             .pending_sort_fields
