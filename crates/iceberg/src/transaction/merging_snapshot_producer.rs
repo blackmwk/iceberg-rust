@@ -37,7 +37,7 @@ use crate::transaction::snapshot_helpers::{
 use crate::{Error, ErrorKind, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CurrentSnapshotFingerprint {
+struct SnapshotFingerprint {
     snapshot_id: i64,
     parent_snapshot_id: Option<i64>,
     sequence_number: i64,
@@ -46,8 +46,30 @@ struct CurrentSnapshotFingerprint {
 
 #[derive(Debug)]
 struct CurrentSnapshot {
-    fingerprint: CurrentSnapshotFingerprint,
+    fingerprint: SnapshotFingerprint,
     manifests: Vec<ManifestFile>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProcessedSnapshot {
+    fingerprint: SnapshotFingerprint,
+    operation: Operation,
+    data_manifests: Vec<ManifestFile>,
+    delete_manifests: Vec<ManifestFile>,
+}
+
+impl ProcessedSnapshot {
+    pub(crate) fn operation(&self) -> &Operation {
+        &self.operation
+    }
+
+    pub(crate) fn data_manifests(&self) -> &[ManifestFile] {
+        &self.data_manifests
+    }
+
+    pub(crate) fn delete_manifests(&self) -> &[ManifestFile] {
+        &self.delete_manifests
+    }
 }
 
 /// A concrete merging producer retained by a RowDelta action across retries.
@@ -59,6 +81,7 @@ pub(crate) struct MergingSnapshotProducer {
     attempt: u64,
     manifest_counter: u64,
     current_snapshot: Option<CurrentSnapshot>,
+    processed_snapshots: HashMap<i64, ProcessedSnapshot>,
     new_data_manifests: Option<Vec<ManifestFile>>,
     new_delete_manifests: Option<Vec<ManifestFile>>,
     data_filter: Option<ManifestFilterManager>,
@@ -289,7 +312,7 @@ impl MergingSnapshotProducer {
             self.current_snapshot = None;
             return Ok(Vec::new());
         };
-        let fingerprint = CurrentSnapshotFingerprint {
+        let fingerprint = SnapshotFingerprint {
             snapshot_id: snapshot.snapshot_id(),
             parent_snapshot_id: snapshot.parent_snapshot_id(),
             sequence_number: snapshot.sequence_number(),
@@ -312,6 +335,106 @@ impl MergingSnapshotProducer {
             manifests,
         });
         Ok(self.current_snapshot.as_ref().unwrap().manifests.clone())
+    }
+
+    /// Process ancestry down to `starting_snapshot_id` (exclusive), loading
+    /// only snapshots that this producer has not seen on an earlier attempt.
+    pub(crate) async fn process_new_snapshots(
+        &mut self,
+        table: &Table,
+        starting_snapshot_id: Option<i64>,
+    ) -> Result<Vec<i64>> {
+        let mut snapshot = table.metadata().current_snapshot().cloned();
+        let mut visited = HashSet::new();
+        let mut newly_processed = Vec::new();
+        let mut reached_start = starting_snapshot_id.is_none();
+
+        while let Some(current) = snapshot {
+            let snapshot_id = current.snapshot_id();
+            if Some(snapshot_id) == starting_snapshot_id {
+                reached_start = true;
+                break;
+            }
+            if !visited.insert(snapshot_id) {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Snapshot ancestry contains a cycle at {snapshot_id}"),
+                ));
+            }
+            if self.load_processed_snapshot(table, &current).await? {
+                newly_processed.push(snapshot_id);
+            }
+            snapshot = current
+                .parent_snapshot_id()
+                .and_then(|parent| table.metadata().snapshot_by_id(parent).cloned());
+        }
+
+        if !reached_start {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot determine history from the current snapshot to starting snapshot {}",
+                    starting_snapshot_id.unwrap()
+                ),
+            ));
+        }
+        Ok(newly_processed)
+    }
+
+    async fn load_processed_snapshot(
+        &mut self,
+        table: &Table,
+        snapshot: &crate::spec::SnapshotRef,
+    ) -> Result<bool> {
+        let snapshot_id = snapshot.snapshot_id();
+        let fingerprint = SnapshotFingerprint {
+            snapshot_id,
+            parent_snapshot_id: snapshot.parent_snapshot_id(),
+            sequence_number: snapshot.sequence_number(),
+            manifest_list: snapshot.manifest_list().to_string(),
+        };
+        if let Some(processed) = self.processed_snapshots.get(&snapshot_id) {
+            if processed.fingerprint != fingerprint {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Snapshot {snapshot_id} changed while retrying a commit"),
+                ));
+            }
+            return Ok(false);
+        }
+
+        let manifests = if let Some(current) = &self.current_snapshot
+            && current.fingerprint == fingerprint
+        {
+            current.manifests.clone()
+        } else {
+            let list = table.manifest_list_reader(snapshot).load().await?;
+            #[cfg(test)]
+            {
+                self.manifest_list_loads += 1;
+            }
+            list.consume_entries().into_iter().collect()
+        };
+        let mut data_manifests = Vec::new();
+        let mut delete_manifests = Vec::new();
+        for manifest in manifests {
+            match manifest.content {
+                ManifestContentType::Data => data_manifests.push(manifest),
+                ManifestContentType::Deletes => delete_manifests.push(manifest),
+            }
+        }
+        self.processed_snapshots
+            .insert(snapshot_id, ProcessedSnapshot {
+                fingerprint,
+                operation: snapshot.summary().operation.clone(),
+                data_manifests,
+                delete_manifests,
+            });
+        Ok(true)
+    }
+
+    pub(crate) fn processed_snapshot(&self, snapshot_id: i64) -> Option<&ProcessedSnapshot> {
+        self.processed_snapshots.get(&snapshot_id)
     }
 
     async fn new_data_manifests(
@@ -576,6 +699,50 @@ mod tests {
         .close()
         .await
         .unwrap();
+    }
+
+    async fn write_empty_manifest_lists(table: &Table) {
+        for snapshot in table.metadata().snapshots() {
+            let output = table
+                .file_io()
+                .new_output(snapshot.manifest_list())
+                .unwrap();
+            ManifestListWriter::v2(
+                output.writer().await.unwrap(),
+                snapshot.snapshot_id(),
+                snapshot.parent_snapshot_id(),
+                snapshot.sequence_number(),
+            )
+            .close()
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn processes_each_snapshot_manifest_list_once() {
+        let table = make_v2_table();
+        write_empty_manifest_lists(&table).await;
+        let mut producer = MergingSnapshotProducer::default();
+
+        let first = producer.process_new_snapshots(&table, None).await.unwrap();
+        assert_eq!(first.len(), table.metadata().snapshots().count());
+        let loads = producer.manifest_list_loads;
+        let retry = producer.process_new_snapshots(&table, None).await.unwrap();
+        assert!(retry.is_empty());
+        assert_eq!(producer.manifest_list_loads, loads);
+    }
+
+    #[tokio::test]
+    async fn rejects_non_ancestor_validation_boundary() {
+        let table = make_v2_table();
+        write_empty_manifest_lists(&table).await;
+        let mut producer = MergingSnapshotProducer::default();
+        let error = producer
+            .process_new_snapshots(&table, Some(i64::MAX))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
     }
 
     #[tokio::test]
