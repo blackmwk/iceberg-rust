@@ -3251,10 +3251,17 @@ pub struct iceberg::transaction::RowDeltaAction
 impl iceberg::transaction::RowDeltaAction
 pub fn iceberg::transaction::RowDeltaAction::add_data_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
 pub fn iceberg::transaction::RowDeltaAction::add_delete_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
+pub fn iceberg::transaction::RowDeltaAction::case_sensitive(self, case_sensitive: bool) -> Self
+pub fn iceberg::transaction::RowDeltaAction::conflict_detection_filter(self, predicate: iceberg::expr::Predicate) -> Self
 pub fn iceberg::transaction::RowDeltaAction::remove_data_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
 pub fn iceberg::transaction::RowDeltaAction::remove_delete_files(self, files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
 pub fn iceberg::transaction::RowDeltaAction::set_commit_uuid(self, commit_uuid: uuid::Uuid) -> Self
 pub fn iceberg::transaction::RowDeltaAction::set_snapshot_properties(self, properties: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn iceberg::transaction::RowDeltaAction::validate_data_files_exist<I, S>(self, files: I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn iceberg::transaction::RowDeltaAction::validate_deleted_files(self) -> Self
+pub fn iceberg::transaction::RowDeltaAction::validate_from_snapshot(self, snapshot_id: i64) -> Self
+pub fn iceberg::transaction::RowDeltaAction::validate_no_conflicting_data_files(self) -> Self
+pub fn iceberg::transaction::RowDeltaAction::validate_no_conflicting_delete_files(self) -> Self
 pub fn iceberg::transaction::RowDeltaAction::with_check_duplicate(self, check: bool) -> Self
 pub struct iceberg::transaction::Transaction
 impl iceberg::transaction::Transaction

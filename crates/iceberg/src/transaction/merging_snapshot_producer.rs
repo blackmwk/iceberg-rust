@@ -384,6 +384,26 @@ impl MergingSnapshotProducer {
         Ok(newly_processed)
     }
 
+    pub(crate) fn validate_starting_snapshot(
+        &self,
+        table: &Table,
+        starting_snapshot_id: i64,
+    ) -> Result<()> {
+        let mut snapshot = table.metadata().current_snapshot();
+        while let Some(current) = snapshot {
+            if current.snapshot_id() == starting_snapshot_id {
+                return Ok(());
+            }
+            snapshot = current
+                .parent_snapshot_id()
+                .and_then(|parent| table.metadata().snapshot_by_id(parent));
+        }
+        Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Snapshot {starting_snapshot_id} is not an ancestor of the current snapshot"),
+        ))
+    }
+
     async fn load_processed_snapshot(
         &mut self,
         table: &Table,
@@ -418,6 +438,12 @@ impl MergingSnapshotProducer {
             }
             list.consume_entries().into_iter().collect()
         };
+        if table.metadata().current_snapshot_id() == Some(snapshot_id) {
+            self.current_snapshot = Some(CurrentSnapshot {
+                fingerprint: fingerprint.clone(),
+                manifests: manifests.clone(),
+            });
+        }
         let mut data_manifests = Vec::new();
         let mut delete_manifests = Vec::new();
         for manifest in manifests {
@@ -438,6 +464,11 @@ impl MergingSnapshotProducer {
 
     pub(crate) fn processed_snapshot(&self, snapshot_id: i64) -> Option<&ProcessedSnapshot> {
         self.processed_snapshots.get(&snapshot_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manifest_list_loads(&self) -> usize {
+        self.manifest_list_loads
     }
 
     async fn validation_history(
