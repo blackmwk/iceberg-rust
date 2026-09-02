@@ -30,6 +30,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
+use crate::transaction::conflict_filter::ConflictFilter;
 use crate::transaction::manifest_filter::ManifestFilterManager;
 use crate::transaction::snapshot_helpers::{
     delete_artifact, generate_snapshot_id, manifest_list_path, manifest_path, write_snapshot_commit,
@@ -83,6 +84,7 @@ pub(crate) struct MergingSnapshotProducer {
     current_snapshot: Option<CurrentSnapshot>,
     processed_snapshots: HashMap<i64, ProcessedSnapshot>,
     loaded_manifests: HashMap<String, crate::spec::Manifest>,
+    predicate_results: HashMap<String, (bool, bool)>,
     new_data_manifests: Option<Vec<ManifestFile>>,
     new_delete_manifests: Option<Vec<ManifestFile>>,
     data_filter: Option<ManifestFilterManager>,
@@ -618,6 +620,74 @@ impl MergingSnapshotProducer {
             }
         }
         Ok(live)
+    }
+
+    /// Detect predicate-scoped additions and removals in snapshots committed
+    /// after the validation boundary.
+    pub(crate) async fn validate_no_conflicting_files(
+        &mut self,
+        table: &Table,
+        starting_snapshot_id: Option<i64>,
+        filter: &ConflictFilter,
+        check_data_additions: bool,
+        check_delete_additions: bool,
+        check_removals: bool,
+    ) -> Result<()> {
+        let history = self.validation_history(table, starting_snapshot_id).await?;
+        for snapshot_id in history {
+            let manifests = self
+                .processed_snapshots
+                .get(&snapshot_id)
+                .map(|snapshot| {
+                    snapshot
+                        .data_manifests
+                        .iter()
+                        .chain(&snapshot.delete_manifests)
+                        .filter(|manifest| manifest.added_snapshot_id == snapshot_id)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for manifest_file in manifests {
+                if !filter.manifest_could_match(table, &manifest_file)? {
+                    continue;
+                }
+                let manifest = self.load_manifest(table, &manifest_file).await?;
+                for entry in manifest.entries() {
+                    let is_removal = entry.status() == ManifestStatus::Deleted;
+                    let is_addition = entry.status() == ManifestStatus::Added;
+                    let should_check = (is_removal && check_removals)
+                        || (is_addition
+                            && match entry.content_type() {
+                                DataContentType::Data => check_data_additions,
+                                DataContentType::PositionDeletes
+                                | DataContentType::EqualityDeletes => check_delete_additions,
+                            });
+                    if !should_check {
+                        continue;
+                    }
+                    let path = entry.file_path();
+                    let (could_match, must_match) =
+                        if let Some(result) = self.predicate_results.get(path) {
+                            *result
+                        } else {
+                            let result = (
+                                filter.could_match(table, entry.data_file())?,
+                                filter.must_match(table, entry.data_file())?,
+                            );
+                            self.predicate_results.insert(path.to_string(), result);
+                            result
+                        };
+                    if could_match || (is_removal && must_match) {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Conflicting file {path} matches the validation filter"),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn new_data_manifests(
