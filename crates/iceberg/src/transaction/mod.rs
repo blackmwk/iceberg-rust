@@ -58,6 +58,7 @@ mod conflict_filter;
 mod expire_snapshots;
 mod manifest_filter;
 mod merging_snapshot_producer;
+mod row_delta;
 mod simple_snapshot_producer;
 mod snapshot_helpers;
 mod sort_order;
@@ -79,6 +80,7 @@ use crate::table::Table;
 use crate::transaction::action::TransactionActionEntry;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::row_delta::RowDeltaAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
 pub use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -165,6 +167,11 @@ impl Transaction {
     /// Creates a fast append action.
     pub fn fast_append(&self) -> FastAppendAction {
         FastAppendAction::new()
+    }
+
+    /// Creates a row delta action for row-level additions and removals.
+    pub fn row_delta(&self) -> RowDeltaAction {
+        RowDeltaAction::new()
     }
 
     /// Creates replace sort order action.

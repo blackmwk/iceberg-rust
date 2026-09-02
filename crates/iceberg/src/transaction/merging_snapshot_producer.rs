@@ -503,6 +503,36 @@ impl MergingSnapshotProducer {
         }
     }
 
+    pub(crate) async fn validate_duplicate_files(
+        &mut self,
+        table: &Table,
+        added_data_files: &[DataFile],
+        added_delete_files: &[DataFile],
+    ) -> Result<()> {
+        let live = self.live_files(table).await?;
+        let duplicates: Vec<_> = added_data_files
+            .iter()
+            .filter(|file| live.data.contains_key(file.file_path()))
+            .chain(
+                added_delete_files
+                    .iter()
+                    .filter(|file| live.deletes.contains_key(file.file_path())),
+            )
+            .map(|file| file.file_path().to_string())
+            .collect();
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot add files that are already referenced by table: {}",
+                    duplicates.join(", ")
+                ),
+            ))
+        }
+    }
+
     /// Reject referenced paths removed or rewritten since the validation boundary.
     pub(crate) async fn validate_no_rewrites(
         &mut self,
