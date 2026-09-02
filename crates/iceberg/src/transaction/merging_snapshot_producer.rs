@@ -1,0 +1,470 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Persistent producer for snapshot actions that merge additions and removals.
+
+#![allow(dead_code)] // RowDelta is introduced by later stack layers.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use uuid::Uuid;
+
+use crate::spec::{
+    DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestContentType, ManifestEntry,
+    ManifestFile, ManifestStatus, ManifestWriter, ManifestWriterBuilder, Operation, Struct,
+    StructType,
+};
+use crate::table::Table;
+use crate::transaction::ActionCommit;
+use crate::transaction::snapshot_helpers::{
+    generate_snapshot_id, manifest_list_path, manifest_path, write_snapshot_commit,
+};
+use crate::{Error, ErrorKind, Result};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CurrentSnapshotFingerprint {
+    snapshot_id: i64,
+    parent_snapshot_id: Option<i64>,
+    sequence_number: i64,
+    manifest_list: String,
+}
+
+#[derive(Debug)]
+struct CurrentSnapshot {
+    fingerprint: CurrentSnapshotFingerprint,
+    manifests: Vec<ManifestFile>,
+}
+
+/// A concrete merging producer retained by a RowDelta action across retries.
+#[derive(Default)]
+pub(crate) struct MergingSnapshotProducer {
+    requested_commit_uuid: Option<Uuid>,
+    commit_uuid: Option<Uuid>,
+    snapshot_id: Option<i64>,
+    attempt: u64,
+    manifest_counter: u64,
+    current_snapshot: Option<CurrentSnapshot>,
+    new_data_manifests: Option<Vec<ManifestFile>>,
+    new_delete_manifests: Option<Vec<ManifestFile>>,
+    attempted_manifest_lists: HashSet<String>,
+    owned_artifacts: HashSet<String>,
+    #[cfg(test)]
+    manifest_list_loads: usize,
+    #[cfg(test)]
+    new_manifest_writes: usize,
+}
+
+impl MergingSnapshotProducer {
+    pub(crate) fn new(commit_uuid: Option<Uuid>) -> Self {
+        Self {
+            requested_commit_uuid: commit_uuid,
+            ..Self::default()
+        }
+    }
+
+    fn commit_uuid(&mut self) -> Uuid {
+        *self
+            .commit_uuid
+            .get_or_insert_with(|| self.requested_commit_uuid.unwrap_or_else(Uuid::now_v7))
+    }
+
+    fn snapshot_id(&mut self, table: &Table) -> i64 {
+        *self
+            .snapshot_id
+            .get_or_insert_with(|| generate_snapshot_id(table))
+    }
+
+    fn next_manifest_path(&mut self, table: &Table) -> Result<String> {
+        let commit_uuid = self.commit_uuid();
+        let counter = self.manifest_counter;
+        self.manifest_counter += 1;
+        manifest_path(table, commit_uuid, counter)
+    }
+
+    fn next_manifest_list_path(&mut self, table: &Table) -> Result<String> {
+        let snapshot_id = self.snapshot_id(table);
+        let commit_uuid = self.commit_uuid();
+        let attempt = self.attempt;
+        self.attempt += 1;
+        let path = manifest_list_path(table, snapshot_id, attempt, commit_uuid)?;
+        self.attempted_manifest_lists.insert(path.clone());
+        self.owned_artifacts.insert(path.clone());
+        Ok(path)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn apply(
+        &mut self,
+        table: &Table,
+        operation: Operation,
+        properties: HashMap<String, String>,
+        added_data_files: &[DataFile],
+        added_delete_files: &[DataFile],
+    ) -> Result<ActionCommit> {
+        if added_data_files.is_empty() && added_delete_files.is_empty() && properties.is_empty() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No files or snapshot properties were provided",
+            ));
+        }
+        self.validate_files(table, added_data_files, added_delete_files)?;
+
+        let mut manifests = self.current_manifests(table).await?;
+        manifests.extend(self.new_data_manifests(table, added_data_files).await?);
+        manifests.extend(self.new_delete_manifests(table, added_delete_files).await?);
+        let mut added_files = Vec::with_capacity(added_data_files.len() + added_delete_files.len());
+        added_files.extend_from_slice(added_data_files);
+        added_files.extend_from_slice(added_delete_files);
+
+        let snapshot_id = self.snapshot_id(table);
+        let manifest_list = self.next_manifest_list_path(table)?;
+        write_snapshot_commit(
+            table,
+            snapshot_id,
+            manifest_list,
+            operation,
+            properties,
+            &added_files,
+            &[],
+            manifests,
+        )
+        .await
+    }
+
+    fn validate_files(
+        &self,
+        table: &Table,
+        data_files: &[DataFile],
+        delete_files: &[DataFile],
+    ) -> Result<()> {
+        for file in data_files {
+            if file.content_type() != DataContentType::Data {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Row data files must have data content",
+                ));
+            }
+            validate_partition(table, file)?;
+        }
+        for file in delete_files {
+            if file.content_type() == DataContentType::Data {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Delete files must have position or equality delete content",
+                ));
+            }
+            validate_delete_version(table.metadata().format_version(), file)?;
+            validate_partition(table, file)?;
+        }
+        Ok(())
+    }
+
+    async fn current_manifests(&mut self, table: &Table) -> Result<Vec<ManifestFile>> {
+        let Some(snapshot) = table.metadata().current_snapshot() else {
+            self.current_snapshot = None;
+            return Ok(Vec::new());
+        };
+        let fingerprint = CurrentSnapshotFingerprint {
+            snapshot_id: snapshot.snapshot_id(),
+            parent_snapshot_id: snapshot.parent_snapshot_id(),
+            sequence_number: snapshot.sequence_number(),
+            manifest_list: snapshot.manifest_list().to_string(),
+        };
+        if let Some(cached) = &self.current_snapshot
+            && cached.fingerprint == fingerprint
+        {
+            return Ok(cached.manifests.clone());
+        }
+
+        let list = table.manifest_list_reader(snapshot).load().await?;
+        #[cfg(test)]
+        {
+            self.manifest_list_loads += 1;
+        }
+        let manifests = list.consume_entries().into_iter().collect();
+        self.current_snapshot = Some(CurrentSnapshot {
+            fingerprint,
+            manifests,
+        });
+        Ok(self.current_snapshot.as_ref().unwrap().manifests.clone())
+    }
+
+    async fn new_data_manifests(
+        &mut self,
+        table: &Table,
+        files: &[DataFile],
+    ) -> Result<Vec<ManifestFile>> {
+        if let Some(manifests) = &self.new_data_manifests {
+            return Ok(manifests.clone());
+        }
+        let manifests = self
+            .write_manifests(table, ManifestContentType::Data, files)
+            .await?;
+        self.new_data_manifests = Some(manifests.clone());
+        Ok(manifests)
+    }
+
+    async fn new_delete_manifests(
+        &mut self,
+        table: &Table,
+        files: &[DataFile],
+    ) -> Result<Vec<ManifestFile>> {
+        if let Some(manifests) = &self.new_delete_manifests {
+            return Ok(manifests.clone());
+        }
+        let manifests = self
+            .write_manifests(table, ManifestContentType::Deletes, files)
+            .await?;
+        self.new_delete_manifests = Some(manifests.clone());
+        Ok(manifests)
+    }
+
+    async fn write_manifests(
+        &mut self,
+        table: &Table,
+        content: ManifestContentType,
+        files: &[DataFile],
+    ) -> Result<Vec<ManifestFile>> {
+        let mut by_spec: BTreeMap<i32, Vec<DataFile>> = BTreeMap::new();
+        for file in files {
+            by_spec
+                .entry(file.partition_spec_id)
+                .or_default()
+                .push(file.clone());
+        }
+
+        let mut manifests = Vec::with_capacity(by_spec.len());
+        for (spec_id, files) in by_spec {
+            let path = self.next_manifest_path(table)?;
+            let mut writer = self
+                .new_manifest_writer(table, &path, spec_id, content)
+                .await?;
+            let snapshot_id = self.snapshot_id(table);
+            for file in files {
+                let builder = ManifestEntry::builder()
+                    .status(ManifestStatus::Added)
+                    .data_file(file);
+                let entry = if table.metadata().format_version() == FormatVersion::V1 {
+                    builder.snapshot_id(snapshot_id).build()
+                } else {
+                    builder.build()
+                };
+                writer.add_entry(entry)?;
+            }
+            let manifest = writer.write_manifest_file().await?;
+            self.owned_artifacts.insert(path);
+            manifests.push(manifest);
+            #[cfg(test)]
+            {
+                self.new_manifest_writes += 1;
+            }
+        }
+        Ok(manifests)
+    }
+
+    async fn new_manifest_writer(
+        &mut self,
+        table: &Table,
+        path: &str,
+        spec_id: i32,
+        content: ManifestContentType,
+    ) -> Result<ManifestWriter> {
+        let spec = table
+            .metadata()
+            .partition_spec_by_id(spec_id)
+            .ok_or_else(|| unknown_spec(spec_id))?
+            .as_ref()
+            .clone();
+        let schema = table.metadata().current_schema().clone();
+        let output = table.file_io().new_output(path)?;
+        let snapshot_id = self.snapshot_id(table);
+        let builder = match table.encryption_manager() {
+            Some(manager) => ManifestWriterBuilder::new_from_encrypted(
+                manager.encrypt(output),
+                Some(snapshot_id),
+                schema,
+                spec,
+            )?,
+            None => ManifestWriterBuilder::new(output, Some(snapshot_id), schema, spec),
+        };
+        match (table.metadata().format_version(), content) {
+            (FormatVersion::V1, ManifestContentType::Data) => Ok(builder.build_v1()),
+            (FormatVersion::V1, ManifestContentType::Deletes) => Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Delete manifests are not supported in V1",
+            )),
+            (FormatVersion::V2, ManifestContentType::Data) => Ok(builder.build_v2_data()),
+            (FormatVersion::V2, ManifestContentType::Deletes) => Ok(builder.build_v2_deletes()),
+            (FormatVersion::V3, ManifestContentType::Data) => Ok(builder.build_v3_data()),
+            (FormatVersion::V3, ManifestContentType::Deletes) => Ok(builder.build_v3_deletes()),
+        }
+    }
+}
+
+fn validate_delete_version(version: FormatVersion, file: &DataFile) -> Result<()> {
+    let deletion_vector = file.file_format() == DataFileFormat::Puffin
+        || file.content_offset().is_some()
+        || file.content_size_in_bytes().is_some();
+    if deletion_vector {
+        return Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Deletion vectors are not supported by RowDelta",
+        ));
+    }
+    match version {
+        FormatVersion::V1 => Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Delete files are not supported in V1",
+        )),
+        FormatVersion::V3 if file.content_type() == DataContentType::PositionDeletes => {
+            Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "V3 position deletes require deletion vectors, which are not supported",
+            ))
+        }
+        FormatVersion::V2 | FormatVersion::V3 => Ok(()),
+    }
+}
+
+fn validate_partition(table: &Table, file: &DataFile) -> Result<()> {
+    let spec = table
+        .metadata()
+        .partition_spec_by_id(file.partition_spec_id)
+        .ok_or_else(|| unknown_spec(file.partition_spec_id))?;
+    let partition_type = spec.partition_type(table.metadata().current_schema())?;
+    validate_partition_value(file.partition(), &partition_type)
+}
+
+fn unknown_spec(spec_id: i32) -> Error {
+    Error::new(
+        ErrorKind::DataInvalid,
+        format!("Cannot write a file for unknown partition spec {spec_id}"),
+    )
+}
+
+fn validate_partition_value(value: &Struct, partition_type: &StructType) -> Result<()> {
+    if value.fields().len() != partition_type.fields().len() {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Partition value is not compatible with partition type",
+        ));
+    }
+    for (value, field) in value.fields().iter().zip(partition_type.fields()) {
+        let primitive = field.field_type.as_primitive_type().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Partition field should only be a primitive type",
+            )
+        })?;
+        if let Some(value) = value
+            && !primitive.compatible(&value.as_primitive_literal().unwrap())
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Partition value is not compatible with partition type",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{DataFileBuilder, Literal, ManifestListWriter};
+    use crate::transaction::tests::make_v2_table;
+
+    fn file(table: &Table, content: DataContentType, path: &str) -> DataFile {
+        DataFileBuilder::default()
+            .content(content)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(1)
+            .file_size_in_bytes(10)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .equality_ids((content == DataContentType::EqualityDeletes).then_some(vec![1]))
+            .build()
+            .unwrap()
+    }
+
+    async fn write_empty_current_manifest_list(table: &Table) {
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let output = table
+            .file_io()
+            .new_output(snapshot.manifest_list())
+            .unwrap();
+        ManifestListWriter::v2(
+            output.writer().await.unwrap(),
+            snapshot.snapshot_id(),
+            snapshot.parent_snapshot_id(),
+            snapshot.sequence_number(),
+        )
+        .close()
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn writes_data_and_delete_manifests_once_across_attempts() {
+        let table = make_v2_table();
+        write_empty_current_manifest_list(&table).await;
+        let data = file(&table, DataContentType::Data, "s3://bucket/data.parquet");
+        let delete = file(
+            &table,
+            DataContentType::EqualityDeletes,
+            "s3://bucket/delete.parquet",
+        );
+        let mut producer = MergingSnapshotProducer::default();
+
+        for _ in 0..2 {
+            producer
+                .apply(
+                    &table,
+                    Operation::Overwrite,
+                    HashMap::new(),
+                    std::slice::from_ref(&data),
+                    std::slice::from_ref(&delete),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(producer.new_manifest_writes, 2);
+        assert_eq!(producer.manifest_list_loads, 1);
+        assert_eq!(producer.attempted_manifest_lists.len(), 2);
+    }
+
+    #[test]
+    fn rejects_deletion_vectors() {
+        let table = make_v2_table();
+        let mut dv = file(
+            &table,
+            DataContentType::PositionDeletes,
+            "s3://bucket/dv.puffin",
+        );
+        dv.file_format = DataFileFormat::Puffin;
+        let producer = MergingSnapshotProducer::default();
+        assert_eq!(
+            producer
+                .validate_files(&table, &[], &[dv])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::FeatureUnsupported
+        );
+    }
+}
