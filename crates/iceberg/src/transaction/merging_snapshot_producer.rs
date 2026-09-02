@@ -82,6 +82,7 @@ pub(crate) struct MergingSnapshotProducer {
     manifest_counter: u64,
     current_snapshot: Option<CurrentSnapshot>,
     processed_snapshots: HashMap<i64, ProcessedSnapshot>,
+    loaded_manifests: HashMap<String, crate::spec::Manifest>,
     new_data_manifests: Option<Vec<ManifestFile>>,
     new_delete_manifests: Option<Vec<ManifestFile>>,
     data_filter: Option<ManifestFilterManager>,
@@ -437,6 +438,188 @@ impl MergingSnapshotProducer {
         self.processed_snapshots.get(&snapshot_id)
     }
 
+    async fn validation_history(
+        &mut self,
+        table: &Table,
+        starting_snapshot_id: Option<i64>,
+    ) -> Result<Vec<i64>> {
+        self.process_new_snapshots(table, starting_snapshot_id)
+            .await?;
+        let mut history = Vec::new();
+        let mut snapshot = table.metadata().current_snapshot();
+        while let Some(current) = snapshot {
+            if Some(current.snapshot_id()) == starting_snapshot_id {
+                break;
+            }
+            history.push(current.snapshot_id());
+            snapshot = current
+                .parent_snapshot_id()
+                .and_then(|parent| table.metadata().snapshot_by_id(parent));
+        }
+        Ok(history)
+    }
+
+    async fn load_manifest(
+        &mut self,
+        table: &Table,
+        manifest: &ManifestFile,
+    ) -> Result<crate::spec::Manifest> {
+        if let Some(cached) = self.loaded_manifests.get(&manifest.manifest_path) {
+            return Ok(cached.clone());
+        }
+        let loaded = table.manifest_reader().read(manifest).await?;
+        self.loaded_manifests
+            .insert(manifest.manifest_path.clone(), loaded.clone());
+        Ok(loaded)
+    }
+
+    /// Validate that referenced data paths are live in the current snapshot.
+    pub(crate) async fn validate_data_files_exist(
+        &mut self,
+        table: &Table,
+        paths: &HashSet<String>,
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let live = self.live_files(table).await?;
+        let missing: Vec<_> = paths
+            .iter()
+            .filter(|path| !live.data.contains_key(*path))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Required data files are no longer live: {}",
+                    missing.join(", ")
+                ),
+            ))
+        }
+    }
+
+    /// Reject referenced paths removed or rewritten since the validation boundary.
+    pub(crate) async fn validate_no_rewrites(
+        &mut self,
+        table: &Table,
+        starting_snapshot_id: Option<i64>,
+        paths: &HashSet<String>,
+    ) -> Result<()> {
+        let history = self.validation_history(table, starting_snapshot_id).await?;
+        for snapshot_id in history {
+            let manifests = self
+                .processed_snapshots
+                .get(&snapshot_id)
+                .map(|snapshot| snapshot.data_manifests.clone())
+                .unwrap_or_default();
+            for manifest_file in manifests
+                .into_iter()
+                .filter(|manifest| manifest.added_snapshot_id == snapshot_id)
+            {
+                let removed = self
+                    .load_manifest(table, &manifest_file)
+                    .await?
+                    .entries()
+                    .iter()
+                    .any(|entry| {
+                        entry.status() == ManifestStatus::Deleted
+                            && paths.contains(entry.file_path())
+                    });
+                if removed {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "A required data file was concurrently removed or rewritten",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject delete files introduced since the boundary that apply to the
+    /// supplied data files according to Iceberg sequence rules.
+    pub(crate) async fn validate_no_new_deletes_for_data_files(
+        &mut self,
+        table: &Table,
+        starting_snapshot_id: Option<i64>,
+        data_files: &[DataFile],
+        ignore_equality_deletes: bool,
+    ) -> Result<()> {
+        let live = self.live_files(table).await?;
+        let history = self.validation_history(table, starting_snapshot_id).await?;
+        for snapshot_id in history {
+            let manifests = self
+                .processed_snapshots
+                .get(&snapshot_id)
+                .map(|snapshot| snapshot.delete_manifests.clone())
+                .unwrap_or_default();
+            for manifest_file in manifests
+                .into_iter()
+                .filter(|manifest| manifest.added_snapshot_id == snapshot_id)
+            {
+                let manifest = self.load_manifest(table, &manifest_file).await?;
+                for delete in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                    if ignore_equality_deletes
+                        && delete.content_type() == DataContentType::EqualityDeletes
+                    {
+                        continue;
+                    }
+                    for data_file in data_files {
+                        let data_sequence = live
+                            .data
+                            .get(data_file.file_path())
+                            .and_then(|file| file.sequence_number)
+                            .unwrap_or(0);
+                        if delete_applies(
+                            data_file,
+                            data_sequence,
+                            delete.data_file(),
+                            delete.sequence_number().unwrap_or(0),
+                        ) {
+                            return Err(Error::new(
+                                ErrorKind::DataInvalid,
+                                format!(
+                                    "New delete file {} applies to data file {}",
+                                    delete.file_path(),
+                                    data_file.file_path()
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn live_files(&mut self, table: &Table) -> Result<LiveFiles> {
+        let manifests = self.current_manifests(table).await?;
+        let mut live = LiveFiles::default();
+        for manifest_file in manifests {
+            let content = manifest_file.content;
+            for entry in self
+                .load_manifest(table, &manifest_file)
+                .await?
+                .entries()
+                .iter()
+                .filter(|entry| entry.is_alive())
+            {
+                let destination = if content == ManifestContentType::Data {
+                    &mut live.data
+                } else {
+                    &mut live.deletes
+                };
+                destination.insert(entry.file_path().to_string(), LiveFile {
+                    sequence_number: entry.sequence_number(),
+                });
+            }
+        }
+        Ok(live)
+    }
+
     async fn new_data_manifests(
         &mut self,
         table: &Table,
@@ -546,6 +729,40 @@ impl MergingSnapshotProducer {
             (FormatVersion::V3, ManifestContentType::Data) => Ok(builder.build_v3_data()),
             (FormatVersion::V3, ManifestContentType::Deletes) => Ok(builder.build_v3_deletes()),
         }
+    }
+}
+
+#[derive(Default)]
+struct LiveFiles {
+    data: HashMap<String, LiveFile>,
+    deletes: HashMap<String, LiveFile>,
+}
+
+struct LiveFile {
+    sequence_number: Option<i64>,
+}
+
+fn delete_applies(
+    data: &DataFile,
+    data_sequence: i64,
+    delete: &DataFile,
+    delete_sequence: i64,
+) -> bool {
+    if let Some(referenced) = delete.referenced_data_file()
+        && referenced != data.file_path
+    {
+        return false;
+    }
+    let same_partition = delete.partition().fields().is_empty()
+        || (delete.partition_spec_id == data.partition_spec_id
+            && delete.partition() == data.partition());
+    if !same_partition {
+        return false;
+    }
+    match delete.content_type() {
+        DataContentType::EqualityDeletes => delete_sequence > data_sequence,
+        DataContentType::PositionDeletes => delete_sequence >= data_sequence,
+        DataContentType::Data => false,
     }
 }
 
@@ -871,5 +1088,18 @@ mod tests {
                 .kind(),
             ErrorKind::FeatureUnsupported
         );
+    }
+
+    #[test]
+    fn delete_sequence_rules_are_content_specific() {
+        let table = make_v2_table();
+        let data = file(&table, DataContentType::Data, "data.parquet");
+        let equality = file(&table, DataContentType::EqualityDeletes, "eq.parquet");
+        let position = file(&table, DataContentType::PositionDeletes, "pos.parquet");
+
+        assert!(!delete_applies(&data, 5, &equality, 5));
+        assert!(delete_applies(&data, 5, &equality, 6));
+        assert!(delete_applies(&data, 5, &position, 5));
+        assert!(!delete_applies(&data, 5, &position, 4));
     }
 }
