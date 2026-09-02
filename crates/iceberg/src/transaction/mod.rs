@@ -56,6 +56,7 @@ pub use action::*;
 mod append;
 mod expire_snapshots;
 mod snapshot;
+mod snapshot_helpers;
 mod sort_order;
 mod update_location;
 mod update_properties;
