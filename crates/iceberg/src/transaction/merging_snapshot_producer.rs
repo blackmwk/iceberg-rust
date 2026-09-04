@@ -32,7 +32,7 @@ use crate::table::Table;
 use crate::transaction::ActionCommit;
 use crate::transaction::manifest_filter::ManifestFilterManager;
 use crate::transaction::snapshot_helpers::{
-    generate_snapshot_id, manifest_list_path, manifest_path, write_snapshot_commit,
+    delete_artifact, generate_snapshot_id, manifest_list_path, manifest_path, write_snapshot_commit,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -162,6 +162,42 @@ impl MergingSnapshotProducer {
             manifests,
         )
         .await
+    }
+
+    pub(crate) async fn finish_commit(&mut self, table: &Table, commit_error: Option<&Error>) {
+        let retained = match commit_error {
+            None => self.committed_artifacts(table).await,
+            Some(error) if error.kind() == ErrorKind::CatalogCommitConflicts => {
+                Some(HashSet::new())
+            }
+            Some(_) => None,
+        };
+        let Some(retained) = retained else {
+            return;
+        };
+        let obsolete: Vec<_> = self
+            .owned_artifacts
+            .difference(&retained)
+            .cloned()
+            .collect();
+        for path in obsolete {
+            delete_artifact(table, &path).await;
+            self.owned_artifacts.remove(&path);
+        }
+        self.attempted_manifest_lists
+            .retain(|path| retained.contains(path));
+    }
+
+    async fn committed_artifacts(&self, table: &Table) -> Option<HashSet<String>> {
+        let snapshot = table.metadata().snapshot_by_id(self.snapshot_id?)?;
+        let mut retained = HashSet::from([snapshot.manifest_list().to_string()]);
+        let list = table.manifest_list_reader(snapshot).load().await.ok()?;
+        retained.extend(
+            list.entries()
+                .iter()
+                .map(|manifest| manifest.manifest_path.clone()),
+        );
+        Some(retained)
     }
 
     async fn filter_manifests(

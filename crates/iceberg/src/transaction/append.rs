@@ -102,6 +102,15 @@ impl TransactionAction for FastAppendAction {
             .apply(table, self.snapshot_properties.clone(), &data_files)
             .await
     }
+
+    async fn finish_commit(
+        &self,
+        state: &mut Self::State,
+        table: &Table,
+        commit_error: Option<&crate::Error>,
+    ) {
+        state.finish_commit(table, commit_error).await;
+    }
 }
 
 #[cfg(test)]

@@ -198,7 +198,7 @@ impl Transaction {
         let backoff = Self::build_backoff(table_props)?;
         let tx = self;
 
-        (|mut tx: Transaction| async {
+        let (mut tx, result) = (|mut tx: Transaction| async {
             let result = tx.do_commit(catalog).await;
             (tx, result)
         })
@@ -206,8 +206,12 @@ impl Transaction {
         .sleep(tokio::time::sleep)
         .context(tx)
         .when(|e| e.retryable())
-        .await
-        .1
+        .await;
+
+        let cleanup_table = result.as_ref().unwrap_or(&tx.table).clone();
+        tx.finish_actions(&cleanup_table, result.as_ref().err())
+            .await;
+        result
     }
 
     fn build_backoff(props: TableProperties) -> Result<ExponentialBackoff> {
@@ -257,6 +261,15 @@ impl Transaction {
             .build();
 
         catalog.update_table(table_commit).await
+    }
+
+    async fn finish_actions(&mut self, table: &Table, commit_error: Option<&crate::Error>) {
+        for entry in &mut self.actions {
+            entry
+                .action
+                .finish_commit(entry.retry_state.as_mut(), table, commit_error)
+                .await;
+        }
     }
 }
 
