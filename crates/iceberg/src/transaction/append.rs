@@ -21,11 +21,9 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::spec::DataFile;
 use crate::table::Table;
-use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
-};
+use crate::transaction::simple_snapshot_producer::SimpleSnapshotProducer;
 use crate::transaction::{ActionCommit, TransactionAction};
 
 /// FastAppendAction is a transaction action for fast append data files to the table.
@@ -86,69 +84,23 @@ impl FastAppendAction {
 
 #[async_trait]
 impl TransactionAction for FastAppendAction {
-    type State = ();
+    type State = SimpleSnapshotProducer;
 
-    async fn commit(&self, _state: &mut Self::State, table: &Table) -> Result<ActionCommit> {
-        let snapshot_producer = SnapshotProducer::new(
-            table,
-            self.commit_uuid.unwrap_or_else(Uuid::now_v7),
-            self.snapshot_properties.clone(),
-            self.dedupe_added_files(),
-        );
+    fn new_state(&self) -> Self::State {
+        SimpleSnapshotProducer::new(self.commit_uuid)
+    }
 
-        // validate added files
-        snapshot_producer.validate_added_data_files()?;
+    async fn commit(&self, state: &mut Self::State, table: &Table) -> Result<ActionCommit> {
+        let data_files = self.dedupe_added_files();
+        state.validate_added_data_files(table, &data_files)?;
 
-        // Checks duplicate files
         if self.check_duplicate {
-            snapshot_producer.validate_duplicate_files().await?;
+            state.validate_duplicate_files(table, &data_files).await?;
         }
 
-        snapshot_producer
-            .commit(FastAppendOperation, DefaultManifestProcess)
+        state
+            .apply(table, self.snapshot_properties.clone(), &data_files)
             .await
-    }
-}
-
-struct FastAppendOperation;
-
-impl SnapshotProduceOperation for FastAppendOperation {
-    fn operation(&self) -> Operation {
-        Operation::Append
-    }
-
-    async fn delete_entries(
-        &self,
-        _snapshot_produce: &SnapshotProducer<'_>,
-    ) -> Result<Vec<ManifestEntry>> {
-        Ok(vec![])
-    }
-
-    async fn existing_manifest(
-        &self,
-        snapshot_produce: &SnapshotProducer<'_>,
-    ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
-            return Ok(vec![]);
-        };
-
-        let manifest_list = snapshot_produce
-            .table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await?;
-
-        Ok(manifest_list
-            .entries()
-            .iter()
-            .filter(|entry| {
-                // Keep delete-only manifests too: they record which files were removed and
-                // must persist across snapshots until `expire_snapshots` cleans them up.
-                // Dropping them lets the removed files reappear as live data (see #2148).
-                entry.has_added_files() || entry.has_existing_files() || entry.has_deleted_files()
-            })
-            .cloned()
-            .collect())
     }
 }
 
@@ -162,6 +114,7 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
+    use super::FastAppendAction;
     use crate::encryption::kms::MemoryKeyManagementClient;
     use crate::encryption::{SensitiveBytes, StandardKeyMetadata};
     use crate::io::FileIO;
@@ -173,8 +126,13 @@ mod tests {
     use crate::table::Table;
     use crate::test_utils::{make_encrypted_table, test_runtime};
     use crate::transaction::tests::make_v2_minimal_table;
-    use crate::transaction::{Transaction, TransactionAction};
+    use crate::transaction::{ActionCommit, Transaction, TransactionAction};
     use crate::{TableIdent, TableRequirement, TableUpdate};
+
+    async fn commit_action(action: FastAppendAction, table: &Table) -> crate::Result<ActionCommit> {
+        let mut state = action.new_state();
+        action.commit(&mut state, table).await
+    }
 
     fn render_template(template: &str, ctx: Value) -> String {
         let mut env = Environment::new();
@@ -342,7 +300,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(vec![new_file]);
-        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
+        let mut action_commit = commit_action(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_snapshot: SnapshotRef = if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
@@ -410,7 +368,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(vec![new_file]);
-        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
+        let mut action_commit = commit_action(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_snapshot: SnapshotRef = updates
@@ -457,7 +415,7 @@ mod tests {
         let table = make_v2_minimal_table();
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(vec![]);
-        assert!(Arc::new(action).commit(&mut (), &table).await.is_err());
+        assert!(commit_action(action, &table).await.is_err());
     }
 
     /// A `fast_append` must write the manifest list and the manifest
@@ -494,7 +452,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(vec![data_file]);
-        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
+        let mut action_commit = commit_action(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_snapshot: SnapshotRef = if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
@@ -554,7 +512,7 @@ mod tests {
             .fast_append()
             .set_snapshot_properties(snapshot_properties)
             .add_data_files(vec![data_file]);
-        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
+        let mut action_commit = commit_action(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         // Check customized properties is contained in snapshot summary properties.
@@ -638,7 +596,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(vec![data_file]);
-        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
+        let mut action_commit = commit_action(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let added_key_ids: Vec<String> = updates
@@ -713,7 +671,7 @@ mod tests {
             .set_snapshot_properties(snapshot_properties)
             .add_data_files(vec![data_file]);
         // Must not panic during total computation.
-        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
+        let mut action_commit = commit_action(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_snapshot = if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
@@ -747,7 +705,7 @@ mod tests {
         let action = tx
             .fast_append()
             .set_snapshot_properties(snapshot_properties);
-        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
+        let mut action_commit = commit_action(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         // Check customized properties is contained in snapshot summary properties.
@@ -786,7 +744,7 @@ mod tests {
 
         let action = action.add_data_files(vec![data_file.clone()]);
 
-        assert!(Arc::new(action).commit(&mut (), &table).await.is_err());
+        assert!(commit_action(action, &table).await.is_err());
     }
 
     #[tokio::test]
@@ -813,7 +771,7 @@ mod tests {
             make_file(200, 20),
             make_file(300, 30),
         ]);
-        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
+        let mut action_commit = commit_action(action, &table).await.unwrap();
         let files = committed_data_files(&table, &action_commit.take_updates()).await;
         assert_eq!(1, files.len());
         assert_eq!(100, files[0].file_size_in_bytes());
@@ -842,7 +800,7 @@ mod tests {
             .fast_append()
             .with_check_duplicate(false)
             .add_data_files(vec![make_file(), make_file()]);
-        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
+        let mut action_commit = commit_action(action, &table).await.unwrap();
         let files = committed_data_files(&table, &action_commit.take_updates()).await;
         assert_eq!(1, files.len());
     }
@@ -865,7 +823,7 @@ mod tests {
             .unwrap();
 
         let action = action.add_data_files(vec![data_file.clone()]);
-        let mut action_commit = Arc::new(action).commit(&mut (), &table).await.unwrap();
+        let mut action_commit = commit_action(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
         let requirements = action_commit.take_requirements();
 
