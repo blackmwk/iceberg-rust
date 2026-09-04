@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::spec::{
     DataContentType, DataFile, FormatVersion, ManifestEntry, ManifestFile, ManifestWriter,
-    ManifestWriterBuilder, Operation, Struct, StructType,
+    ManifestWriterBuilder, Operation, SnapshotRef, Struct, StructType,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -34,17 +34,9 @@ use crate::transaction::snapshot_helpers::{
 };
 use crate::{Error, ErrorKind, Result};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SnapshotFingerprint {
-    snapshot_id: i64,
-    parent_snapshot_id: Option<i64>,
-    sequence_number: i64,
-    manifest_list: String,
-}
-
 #[derive(Debug)]
 struct CachedSnapshot {
-    fingerprint: SnapshotFingerprint,
+    snapshot: SnapshotRef,
     manifests: Vec<ManifestFile>,
 }
 
@@ -59,6 +51,7 @@ pub(crate) struct SimpleSnapshotProducer {
     current_snapshot: Option<CachedSnapshot>,
     added_data_manifest: Option<ManifestFile>,
     attempted_manifest_lists: HashSet<String>,
+    /// Metadata files created by this producer and safe to remove if they are not committed.
     owned_artifacts: HashSet<String>,
     #[cfg(test)]
     manifest_list_loads: usize,
@@ -166,14 +159,8 @@ impl SimpleSnapshotProducer {
             self.current_snapshot = None;
             return Ok(Vec::new());
         };
-        let fingerprint = SnapshotFingerprint {
-            snapshot_id: snapshot.snapshot_id(),
-            parent_snapshot_id: snapshot.parent_snapshot_id(),
-            sequence_number: snapshot.sequence_number(),
-            manifest_list: snapshot.manifest_list().to_string(),
-        };
         if let Some(cached) = &self.current_snapshot
-            && cached.fingerprint == fingerprint
+            && cached.snapshot.as_ref() == snapshot.as_ref()
         {
             return Ok(cached.manifests.clone());
         }
@@ -193,7 +180,7 @@ impl SimpleSnapshotProducer {
             })
             .collect();
         self.current_snapshot = Some(CachedSnapshot {
-            fingerprint,
+            snapshot: snapshot.clone(),
             manifests,
         });
         Ok(self.current_snapshot.as_ref().unwrap().manifests.clone())
