@@ -30,6 +30,7 @@ use crate::spec::{
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
+use crate::transaction::manifest_filter::ManifestFilterManager;
 use crate::transaction::snapshot_helpers::{
     generate_snapshot_id, manifest_list_path, manifest_path, write_snapshot_commit,
 };
@@ -60,6 +61,8 @@ pub(crate) struct MergingSnapshotProducer {
     current_snapshot: Option<CurrentSnapshot>,
     new_data_manifests: Option<Vec<ManifestFile>>,
     new_delete_manifests: Option<Vec<ManifestFile>>,
+    data_filter: Option<ManifestFilterManager>,
+    delete_filter: Option<ManifestFilterManager>,
     attempted_manifest_lists: HashSet<String>,
     owned_artifacts: HashSet<String>,
     #[cfg(test)]
@@ -114,16 +117,32 @@ impl MergingSnapshotProducer {
         properties: HashMap<String, String>,
         added_data_files: &[DataFile],
         added_delete_files: &[DataFile],
+        removed_data_files: &[DataFile],
+        removed_delete_files: &[DataFile],
     ) -> Result<ActionCommit> {
-        if added_data_files.is_empty() && added_delete_files.is_empty() && properties.is_empty() {
+        if added_data_files.is_empty()
+            && added_delete_files.is_empty()
+            && removed_data_files.is_empty()
+            && removed_delete_files.is_empty()
+            && properties.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
                 "No files or snapshot properties were provided",
             ));
         }
         self.validate_files(table, added_data_files, added_delete_files)?;
+        validate_disjoint_changes(
+            added_data_files,
+            added_delete_files,
+            removed_data_files,
+            removed_delete_files,
+        )?;
 
-        let mut manifests = self.current_manifests(table).await?;
+        let current = self.current_manifests(table).await?;
+        let (mut manifests, removed_files) = self
+            .filter_manifests(table, current, removed_data_files, removed_delete_files)
+            .await?;
         manifests.extend(self.new_data_manifests(table, added_data_files).await?);
         manifests.extend(self.new_delete_manifests(table, added_delete_files).await?);
         let mut added_files = Vec::with_capacity(added_data_files.len() + added_delete_files.len());
@@ -139,10 +158,66 @@ impl MergingSnapshotProducer {
             operation,
             properties,
             &added_files,
-            &[],
+            &removed_files,
             manifests,
         )
         .await
+    }
+
+    async fn filter_manifests(
+        &mut self,
+        table: &Table,
+        manifests: Vec<ManifestFile>,
+        removed_data_files: &[DataFile],
+        removed_delete_files: &[DataFile],
+    ) -> Result<(Vec<ManifestFile>, Vec<DataFile>)> {
+        let data_paths = removed_data_files
+            .iter()
+            .map(|file| file.file_path().to_string())
+            .collect::<HashSet<_>>();
+        let delete_paths = removed_delete_files
+            .iter()
+            .map(|file| file.file_path().to_string())
+            .collect::<HashSet<_>>();
+        initialize_filter(&mut self.data_filter, ManifestContentType::Data, data_paths)?;
+        initialize_filter(
+            &mut self.delete_filter,
+            ManifestContentType::Deletes,
+            delete_paths,
+        )?;
+
+        let snapshot_id = self.snapshot_id(table);
+        let commit_uuid = self.commit_uuid();
+        let (manifests, mut removed) = self
+            .data_filter
+            .as_mut()
+            .unwrap()
+            .filter(table, snapshot_id, commit_uuid, manifests)
+            .await?;
+        let (manifests, removed_deletes) = self
+            .delete_filter
+            .as_mut()
+            .unwrap()
+            .filter(table, snapshot_id, commit_uuid, manifests)
+            .await?;
+        removed.extend(removed_deletes);
+        self.owned_artifacts.extend(
+            self.data_filter
+                .as_ref()
+                .unwrap()
+                .owned_artifacts()
+                .iter()
+                .cloned(),
+        );
+        self.owned_artifacts.extend(
+            self.delete_filter
+                .as_ref()
+                .unwrap()
+                .owned_artifacts()
+                .iter()
+                .cloned(),
+        );
+        Ok((manifests, removed))
     }
 
     fn validate_files(
@@ -315,6 +390,54 @@ impl MergingSnapshotProducer {
     }
 }
 
+fn initialize_filter(
+    filter: &mut Option<ManifestFilterManager>,
+    content: ManifestContentType,
+    paths: HashSet<String>,
+) -> Result<()> {
+    match filter {
+        Some(existing) if existing.requested_paths() != &paths => Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Files to remove changed while retrying a snapshot action",
+        )),
+        Some(_) => Ok(()),
+        None => {
+            *filter = Some(ManifestFilterManager::new(content, paths));
+            Ok(())
+        }
+    }
+}
+
+fn validate_disjoint_changes(
+    added_data: &[DataFile],
+    added_deletes: &[DataFile],
+    removed_data: &[DataFile],
+    removed_deletes: &[DataFile],
+) -> Result<()> {
+    let added = added_data
+        .iter()
+        .chain(added_deletes)
+        .map(DataFile::file_path)
+        .collect::<HashSet<_>>();
+    let removed = removed_data
+        .iter()
+        .chain(removed_deletes)
+        .map(DataFile::file_path)
+        .collect::<HashSet<_>>();
+    let overlap = added.intersection(&removed).copied().collect::<Vec<_>>();
+    if overlap.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Cannot add and remove the same files: {}",
+                overlap.join(", ")
+            ),
+        ))
+    }
+}
+
 fn validate_delete_version(version: FormatVersion, file: &DataFile) -> Result<()> {
     let deletion_vector = file.file_format() == DataFileFormat::Puffin
         || file.content_offset().is_some()
@@ -439,6 +562,8 @@ mod tests {
                     HashMap::new(),
                     std::slice::from_ref(&data),
                     std::slice::from_ref(&delete),
+                    &[],
+                    &[],
                 )
                 .await
                 .unwrap();
@@ -447,6 +572,83 @@ mod tests {
         assert_eq!(producer.new_manifest_writes, 2);
         assert_eq!(producer.manifest_list_loads, 1);
         assert_eq!(producer.attempted_manifest_lists.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reuses_filtered_manifest_across_attempts() {
+        let table = make_v2_table();
+        write_empty_current_manifest_list(&table).await;
+        let data = file(&table, DataContentType::Data, "s3://bucket/remove.parquet");
+        let mut append = MergingSnapshotProducer::default();
+        let commit = append
+            .apply(
+                &table,
+                Operation::Append,
+                HashMap::new(),
+                std::slice::from_ref(&data),
+                &[],
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        let table =
+            crate::transaction::Transaction::apply(table, commit, &mut Vec::new(), &mut Vec::new())
+                .unwrap();
+        let mut remove = MergingSnapshotProducer::default();
+        let first = remove
+            .apply(
+                &table,
+                Operation::Delete,
+                HashMap::new(),
+                &[],
+                &[],
+                std::slice::from_ref(&data),
+                &[],
+            )
+            .await
+            .unwrap();
+        let second = remove
+            .apply(
+                &table,
+                Operation::Delete,
+                HashMap::new(),
+                &[],
+                &[],
+                std::slice::from_ref(&data),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        fn manifest_list(mut commit: ActionCommit) -> String {
+            commit
+                .take_updates()
+                .into_iter()
+                .find_map(|update| match update {
+                    crate::TableUpdate::AddSnapshot { snapshot } => {
+                        Some(snapshot.manifest_list().to_string())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        }
+        let first_snapshot = table.file_io().new_input(manifest_list(first)).unwrap();
+        let second_snapshot = table.file_io().new_input(manifest_list(second)).unwrap();
+        let first_list = crate::spec::ManifestList::parse_with_version(
+            &first_snapshot.read().await.unwrap(),
+            FormatVersion::V2,
+        )
+        .unwrap();
+        let second_list = crate::spec::ManifestList::parse_with_version(
+            &second_snapshot.read().await.unwrap(),
+            FormatVersion::V2,
+        )
+        .unwrap();
+        assert_eq!(
+            first_list.entries()[0].manifest_path,
+            second_list.entries()[0].manifest_path
+        );
     }
 
     #[test]
