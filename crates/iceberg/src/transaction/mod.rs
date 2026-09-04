@@ -55,6 +55,7 @@ mod action;
 pub use action::*;
 mod append;
 mod expire_snapshots;
+mod simple_snapshot_producer;
 mod snapshot;
 mod snapshot_helpers;
 mod sort_order;
