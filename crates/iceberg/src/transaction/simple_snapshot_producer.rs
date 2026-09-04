@@ -21,6 +21,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures::TryStreamExt;
+use futures::stream::FuturesUnordered;
 use uuid::Uuid;
 
 use crate::spec::{
@@ -119,6 +121,54 @@ impl SimpleSnapshotProducer {
             validate_partition_value(file.partition(), metadata.default_partition_type())?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn validate_duplicate_files(
+        &mut self,
+        table: &Table,
+        data_files: &[DataFile],
+    ) -> Result<()> {
+        let new_paths: HashSet<&str> = data_files
+            .iter()
+            .map(|file| file.file_path.as_str())
+            .collect();
+        if new_paths.is_empty() {
+            return Ok(());
+        }
+
+        let manifests = self.current_manifests(table).await?;
+        let runtime = table.runtime();
+        let duplicates: Vec<String> = manifests
+            .into_iter()
+            .map(|manifest| {
+                let reader = table.manifest_reader();
+                runtime
+                    .io()
+                    .spawn(async move { reader.read(&manifest).await })
+            })
+            .collect::<FuturesUnordered<_>>()
+            .try_fold(Vec::new(), |mut duplicates, manifest| async {
+                duplicates.extend(
+                    manifest?
+                        .entries()
+                        .iter()
+                        .filter(|entry| entry.is_alive() && new_paths.contains(entry.file_path()))
+                        .map(|entry| entry.file_path().to_string()),
+                );
+                Ok(duplicates)
+            })
+            .await?;
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot add files that are already referenced by table, files: {}",
+                    duplicates.join(", ")
+                ),
+            ))
+        }
     }
 
     pub(crate) async fn apply(
