@@ -54,6 +54,7 @@ mod action;
 
 pub use action::*;
 mod append;
+mod conflict_filter;
 mod expire_snapshots;
 mod manifest_filter;
 mod merging_snapshot_producer;
