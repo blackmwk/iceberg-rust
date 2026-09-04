@@ -32,7 +32,7 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::ActionCommit;
 use crate::transaction::snapshot_helpers::{
-    generate_snapshot_id, manifest_list_path, manifest_path, write_snapshot_commit,
+    delete_artifact, generate_snapshot_id, manifest_list_path, manifest_path, write_snapshot_commit,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -202,6 +202,42 @@ impl SimpleSnapshotProducer {
             manifests,
         )
         .await
+    }
+
+    pub(crate) async fn finish_commit(&mut self, table: &Table, commit_error: Option<&Error>) {
+        let retained = match commit_error {
+            None => self.committed_artifacts(table).await,
+            Some(error) if error.kind() == ErrorKind::CatalogCommitConflicts => {
+                Some(HashSet::new())
+            }
+            Some(_) => None,
+        };
+        let Some(retained) = retained else {
+            return;
+        };
+        let obsolete: Vec<_> = self
+            .owned_artifacts
+            .difference(&retained)
+            .cloned()
+            .collect();
+        for path in obsolete {
+            delete_artifact(table, &path).await;
+            self.owned_artifacts.remove(&path);
+        }
+        self.attempted_manifest_lists
+            .retain(|path| retained.contains(path));
+    }
+
+    async fn committed_artifacts(&self, table: &Table) -> Option<HashSet<String>> {
+        let snapshot = table.metadata().snapshot_by_id(self.snapshot_id?)?;
+        let mut retained = HashSet::from([snapshot.manifest_list().to_string()]);
+        let list = table.manifest_list_reader(snapshot).load().await.ok()?;
+        retained.extend(
+            list.entries()
+                .iter()
+                .map(|manifest| manifest.manifest_path.clone()),
+        );
+        Some(retained)
     }
 
     async fn current_manifests(&mut self, table: &Table) -> Result<Vec<ManifestFile>> {
@@ -386,6 +422,56 @@ mod tests {
         assert_eq!(producer.added_manifest_writes, 1);
         assert_eq!(producer.manifest_list_loads, 1);
         assert_eq!(producer.attempted_manifest_lists.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cleans_unused_attempts_after_success_and_known_failure() {
+        let table = make_v2_table();
+        write_empty_current_manifest_list(&table).await;
+        let file = data_file(&table);
+        let mut producer = SimpleSnapshotProducer::default();
+        producer
+            .apply(&table, HashMap::new(), std::slice::from_ref(&file))
+            .await
+            .unwrap();
+        let commit = producer
+            .apply(&table, HashMap::new(), std::slice::from_ref(&file))
+            .await
+            .unwrap();
+        let committed = crate::transaction::Transaction::apply(
+            table.clone(),
+            commit,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let committed_list = committed
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .manifest_list()
+            .to_string();
+        let unused_list = producer
+            .attempted_manifest_lists
+            .iter()
+            .find(|path| *path != &committed_list)
+            .unwrap()
+            .clone();
+        producer.finish_commit(&committed, None).await;
+        assert!(committed.file_io().exists(&committed_list).await.unwrap());
+        assert!(!committed.file_io().exists(&unused_list).await.unwrap());
+
+        let mut failed = SimpleSnapshotProducer::default();
+        failed
+            .apply(&table, HashMap::new(), std::slice::from_ref(&file))
+            .await
+            .unwrap();
+        let owned = failed.owned_artifacts.clone();
+        let error = Error::new(ErrorKind::CatalogCommitConflicts, "conflict");
+        failed.finish_commit(&table, Some(&error)).await;
+        for path in owned {
+            assert!(!table.file_io().exists(path).await.unwrap());
+        }
     }
 
     #[test]
